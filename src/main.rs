@@ -981,11 +981,11 @@ impl Render for Viewer {
                     .child(overlay_button)
                     // The mode, which opens the capture mode menu.
                     .child(
-                        // A fixed width too: what it says changes with the scale and the game's rate.
+                        // As wide as the mode's name: it only changes when the mode does, not while
+                        // clicking the buttons beside it.
                         div()
                             .id("mode")
                             .h(px(24.))
-                            .w(px(118.))
                             .px(px(6.))
                             .flex()
                             .flex_none()
@@ -997,13 +997,7 @@ impl Render for Viewer {
                             .text_color(rgba(0xffffffb3))
                             .hover(|s| s.bg(rgba(0xffffff26)))
                             .when(self.menu_open, |d| d.bg(rgba(0xffffff26)))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .truncate()
-                                    .child(if mode.is_empty() { "Mode".to_string() } else { mode }),
-                            )
+                            .child(if mode.is_empty() { "Mode".to_string() } else { mode })
                             .child(div().flex_none().font_family(ICON_FONT).text_size(px(9.)).child(ICON_CHEVRON_UP))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.menu_open = !this.menu_open;
