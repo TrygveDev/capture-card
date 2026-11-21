@@ -16,16 +16,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # One cache for CI and releases. Saved from main only: a release (on a tag) restores
+      # main's, so it compiles just Passthru itself, not every dependency.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: passthru
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check the tag matches Cargo.toml
         shell: pwsh
         run: |
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           if ("v$v" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} doesn't match Cargo.toml's version $v" }
-      - name: Test
-        run: cargo test --release
       - name: Build
         run: cargo build --release
+      - name: Test
+        run: cargo test --release
       - name: Package
         shell: pwsh
         run: |

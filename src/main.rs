@@ -1805,6 +1805,7 @@ fn main() {
         }
     }
     log::start();
+    log::exit_on_panic();
     if install::running_installed() {
         update::clean_up();
         install::refresh_registration();

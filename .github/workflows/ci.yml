@@ -11,7 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # One cache for CI and releases. Saved from main only: a release (on a tag) restores
+      # main's, so it compiles just Passthru itself, not every dependency.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: passthru
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test
         run: cargo test --release
       - name: Build

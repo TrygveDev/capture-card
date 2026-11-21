@@ -31,6 +31,24 @@ pub fn start() {
     line(&format!("{} {} started", crate::app::NAME, env!("CARGO_PKG_VERSION")));
 }
 
+/// A panic anywhere ends the app (as `panic = "abort"` would), after writing it to the log:
+/// a thread carrying on half-broken is worse, and the installed app has no console to show it.
+pub fn exit_on_panic() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // try_lock: the panic may have come from inside `line`, holding the lock.
+        if let Ok(mut file) = FILE.try_lock()
+            && let Some((f, _)) = file.as_mut()
+        {
+            let secs = START.get_or_init(Instant::now).elapsed().as_secs_f64();
+            let _ = writeln!(f, "{secs:9.3}  panic: {info}");
+            let _ = f.flush();
+        }
+        default(info);
+        std::process::abort();
+    }));
+}
+
 pub fn line(msg: &str) {
     eprintln!("{msg}");
     crate::telemetry::note("log", || msg.to_string());

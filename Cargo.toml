@@ -63,7 +63,9 @@ opt-level = 3
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# No `panic = "abort"`: tests can't use it, so with it `cargo test --release` and `cargo build
+# --release` each compiled every dependency (twice the CI time). A panic still ends the app:
+# see `log::exit_on_panic`.
 
 [build-dependencies]
 winresource = "0.1"
