@@ -157,6 +157,29 @@ pub fn mode_label(w: u32, h: u32, fps: u32) -> String {
     if w * 9 == h * 16 { format!("{h}p{fps}") } else { format!("{w}×{h} {fps}") }
 }
 
+/// A resolution's name: 1440p, or 3440×1440 for sizes that aren't 16:9.
+pub fn resolution_label(w: u32, h: u32) -> String {
+    if w * 9 == h * 16 { format!("{h}p") } else { format!("{w}×{h}") }
+}
+
+/// The modes on offer grouped by resolution, most pixels first, each with its frame rates
+/// fastest first (one row each in the menu).
+pub fn by_resolution(modes: &[ModeKey]) -> Vec<((u32, u32), Vec<u32>)> {
+    let mut rows: Vec<((u32, u32), Vec<u32>)> = Vec::new();
+    for &(w, h, f) in modes {
+        match rows.iter_mut().find(|r| r.0 == (w, h)) {
+            Some(r) if !r.1.contains(&f) => r.1.push(f),
+            Some(_) => {}
+            None => rows.push(((w, h), vec![f])),
+        }
+    }
+    rows.sort_by_key(|((w, h), _)| std::cmp::Reverse((w * h, *w)));
+    for r in &mut rows {
+        r.1.sort_unstable_by(|a, b| b.cmp(a));
+    }
+    rows
+}
+
 #[derive(Clone, Debug)]
 pub struct VideoOptions {
     pub device: Option<String>,
@@ -1355,6 +1378,17 @@ mod tests {
         assert_eq!(choose_mode(&modes, Some((1920, 1080, 60))).unwrap().key(), (1920, 1080, 60));
         // Not offered (the card follows its input): the best one instead.
         assert_eq!(choose_mode(&modes, Some((3840, 2160, 30))).unwrap().key(), (2560, 1440, 60));
+    }
+
+    #[test]
+    fn modes_group_into_one_row_per_resolution() {
+        let modes = [(2560, 1440, 60), (1920, 1080, 120), (2560, 1440, 120), (3440, 1440, 60), (1920, 1080, 60), (2560, 1440, 30)];
+        assert_eq!(
+            by_resolution(&modes),
+            [((3440, 1440), vec![60]), ((2560, 1440), vec![120, 60, 30]), ((1920, 1080), vec![120, 60])]
+        );
+        assert_eq!(resolution_label(2560, 1440), "1440p");
+        assert_eq!(resolution_label(3440, 1440), "3440×1440");
     }
 
     #[test]

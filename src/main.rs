@@ -536,7 +536,7 @@ impl Viewer {
     }
 
     /// The capture mode menu: what the device offers, and the upscaling switch.
-    fn menu(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    fn menu(&self, max_height: Pixels, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let control = &self.video.control;
         let offered = control.modes.lock().unwrap().clone();
         let wanted = *control.wanted.lock().unwrap();
@@ -584,10 +584,12 @@ impl Viewer {
                         .children(detail.map(|d| div().text_size(px(11.)).text_color(rgba(0xffffff80)).child(d))),
                 )
         };
-        let size = |(w, h, f): video::ModeKey| format!("{w} × {h} at {f} fps");
         let mut menu = div()
             .id("menu")
-            .w(px(300.))
+            // Wide enough for the longest row of frame rates (1080p: seven) on one line.
+            .w(px(372.))
+            .max_h(max_height)
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .p(px(4.))
@@ -597,13 +599,56 @@ impl Viewer {
             .border_color(rgba(0xffffff1a))
             .child(header("CAPTURE MODE"))
             .child(
-                item("mode-auto".into(), "Auto".into(), offered.first().map(|&m| format!("Best offered: {}", size(m))), wanted.is_none())
-                    .on_click(cx.listener(|this, _, _, cx| this.pick_mode(None, cx))),
+                item(
+                    "mode-auto".into(),
+                    "Auto".into(),
+                    offered.first().map(|&(w, h, f)| format!("Best offered: {}", video::mode_label(w, h, f))),
+                    wanted.is_none(),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.pick_mode(None, cx))),
             );
-        for (i, &m) in offered.iter().enumerate() {
+        // One row per resolution, its frame rates as chips: 40-odd modes in about ten rows.
+        for (row, ((w, h), rates)) in video::by_resolution(&offered).into_iter().enumerate() {
+            let picked_here = wanted.is_some_and(|(pw, ph, _)| (pw, ph) == (w, h));
+            let chips = rates.into_iter().map(|f| {
+                let on = wanted == Some((w, h, f));
+                div()
+                    .id(("rate", row * 1000 + f as usize))
+                    .px(px(7.))
+                    .py(px(2.))
+                    .rounded(px(9.))
+                    .text_size(px(11.))
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(rgb(0xffffff)).text_color(rgb(0x000000)).font_weight(FontWeight::SEMIBOLD))
+                    .when(!on, |d| d.bg(rgba(0xffffff14)).text_color(rgba(0xffffffcc)).hover(|s| s.bg(rgba(0xffffff2e))))
+                    .child(f.to_string())
+                    .on_click(cx.listener(move |this, _, _, cx| this.pick_mode(Some((w, h, f)), cx)))
+            });
             menu = menu.child(
-                item(("mode", i).into(), video::mode_label(m.0, m.1, m.2), Some(size(m)), wanted == Some(m))
-                    .on_click(cx.listener(move |this, _, _, cx| this.pick_mode(Some(m), cx))),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(10.))
+                    .py(px(4.))
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .flex_none()
+                            .font_family(ICON_FONT)
+                            .text_size(px(12.))
+                            .text_color(rgb(0xffffff))
+                            .child(if picked_here { ICON_CHECK } else { "" }),
+                    )
+                    .child(
+                        div()
+                            .w(px(72.))
+                            .flex_none()
+                            .text_size(px(13.))
+                            .text_color(rgb(0xffffff))
+                            .child(video::resolution_label(w, h)),
+                    )
+                    .child(div().flex().flex_wrap().gap(px(4.)).flex_1().children(chips)),
             );
         }
         if let Some(m) = wanted.filter(|m| !offered.contains(m)) {
@@ -879,7 +924,9 @@ impl Render for Viewer {
                 .top(logical(fit_y) + px(12.))
         });
 
-        let menu = self.menu_open.then(|| self.menu(cx));
+        // Room above the controls, so the menu never runs off the top (it scrolls instead).
+        let menu_room = (viewport.height - px(90.)).max(px(160.));
+        let menu = self.menu_open.then(|| self.menu(menu_room, cx));
         let controls = div()
             .absolute()
             .bottom(px(14.))
