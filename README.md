@@ -73,6 +73,16 @@ target\release\capture-card.exe --install
 Developer checks: `--gpu-test IMAGE OUTDIR` (synthetic scene) and `--gpu-eval CLIP.y4m OUTDIR`
 (drops frames from a real clip, regenerates them and scores them against the originals).
 
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE.md). The source is open: you're free to use, study, modify
+and share it for any noncommercial purpose (personal use, hobby projects, education, research).
+**Commercial use is not allowed**, including selling it, selling modified versions, or bundling
+it into a paid product. Copies must keep the license and its `Required Notice` lines.
+
+Because commercial use is restricted, this is "source-available" rather than open source in the
+OSI sense.
+
 ## Credits
 
 Created by [Elliot (@ellipog)](https://github.com/ellipog), who wrote the original code and came

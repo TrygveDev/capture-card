@@ -3,6 +3,8 @@ name = "capture-card"
 version = "0.1.0"
 edition = "2024"
 description = "Minimal, low-latency capture card viewer"
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/TrygveDev/capture-card"
 
 [dependencies]
 gpui = "0.2.2"
