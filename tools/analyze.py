@@ -180,8 +180,10 @@ def decode_marks(video: Path) -> list[tuple[float, int | None]]:
     """(time, 16-bit present number or None) for every frame of an output video."""
     times = frame_times(video)
     rows = MARK_H
+    # Every frame as stored: raw output would otherwise be resampled to a constant rate
+    # (frames repeated or dropped), and the n-th frame read wouldn't be the file's n-th.
     cmd = [tool("ffmpeg"), "-v", "error", "-i", str(video), "-vf",
-           f"crop={STRIP_W}:{rows}:0:0,format=gray", "-f", "rawvideo", "-"]
+           f"crop={STRIP_W}:{rows}:0:0,format=gray", "-fps_mode", "passthrough", "-f", "rawvideo", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     size = STRIP_W * rows
     out = []
@@ -414,7 +416,7 @@ def summarise(s: Session, a: dict, displayed: list, present_rows: list) -> dict:
         "latency_present_ms": mean(r["present_ms"] for r in a["latency"]),
         "gpu_pair_ms": mean(p["gpu_ms"] for p in pairs),
         "gpu_pair_p99": pct([p["gpu_ms"] for p in pairs], 99),
-        "ui_fallback_pairs": sum(1 for p in pairs if p["lost"] is not None and p["lost"] > 0.45),
+        "ui_fallback_pairs": sum(1 for p in pairs if p["lost"] is not None and p["lost"] > 0.55),
         "cut_pairs": sum(1 for p in pairs if p["cut"] is not None and p["cut"] > 0.9),
         "skipped_frames": sum(p["skipped"] for p in pairs),
         "backlogs": sum(1 for p in pairs if p["backlog"]),
@@ -479,7 +481,7 @@ def incidents(s: Session, a: dict, present_rows: list) -> list[dict]:
             raw.append((p["x"], "skipped", f"{p['skipped']} skipped in pair ending {p['seq']}", p["seq"], None))
         if p["gpu_ms"] is not None and p["gpu_ms"] > p["every_ms"]:
             raw.append((p["x"], "gpu_over", f"{p['gpu_ms']:.1f} ms of GPU for {p['every_ms']:.1f} ms steps", p["seq"], None))
-        if p["lost"] is not None and p["lost"] > 0.45:
+        if p["lost"] is not None and p["lost"] > 0.55:
             raw.append((p["x"], "ui_fallback", f"{p['lost']:.0%} of the change unfollowable", p["seq"], None))
         if p["cut"] is not None and p["cut"] > 0.9:
             raw.append((p["x"], "cut", f"cost/detail {p['cut']:.2f}", p["seq"], None))
@@ -628,9 +630,9 @@ def build_charts(a: dict) -> list[dict]:
             {"label": "step between frames", "color": "--muted", "line": True, **series(a["pairs"], "every_ms")},
         ]},
         {"title": "Frame generation: tests (above the line: whole-frame fallback)", "unit": "", "kind": "dots", "ymax": 1.05, "series": [
-            {"label": "unfollowable share (UI test, fallback at 0.45)", "color": "--c5", **series(a["pairs"], "lost")},
+            {"label": "unfollowable share (UI test, fallback from 0.55)", "color": "--c5", **series(a["pairs"], "lost")},
             {"label": "cost/detail (cut test, cut at 0.9)", "color": "--c3", **series(a["pairs"], "cut")},
-        ], "rules": [0.45, 0.9]},
+        ], "rules": [0.55, 0.9]},
         {"title": "Rates", "unit": "fps", "kind": "lines", "series": [
             {"label": name, "color": color, "x": a["rates"]["x"], "y": [round(v, 1) for v in a["rates"][key]]}
             for key, name, color in (("card", "card", "--c3"), ("game", "game pictures", "--c2"),

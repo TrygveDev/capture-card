@@ -35,8 +35,14 @@ const MAX_STEPS: u32 = 8;
 const MAX_CADENCE: u32 = 4;
 /// No frame for this long: show black (the UI says "No signal").
 const SIGNAL_TIMEOUT: Duration = Duration::from_millis(1000);
-/// Generated frames are presented this long after a vblank, so each lands on the next one.
-const VBLANK_PHASE: Duration = Duration::from_millis(1);
+/// Frames are presented this far into a refresh (a share of it) after a vblank, measured on
+/// the real vblanks (`Vsync`). Test sessions at 240 Hz: presents 1-2.75 ms after a vblank
+/// reach the screen at the next one 97-98% of the time; from 3 ms on DWM has already composed
+/// it and they slip a refresh (21% at 3.25 ms, 50% at 3.5). Early in the refresh leaves the
+/// most room for the scheduler's lateness and the draw.
+const PRESENT_PHASE: f64 = 0.3;
+/// A new picture waits while a present is due within its GPU work plus this (see `run`).
+const DEFER_MARGIN: Duration = Duration::from_millis(2);
 /// How long a pair's GPU work (motion and its generated frames) is assumed to take before
 /// it has been measured.
 const GPU_GUESS: Duration = Duration::from_millis(8);
@@ -279,23 +285,82 @@ impl Cadence {
 }
 
 /// The display's next vblank from now and its refresh period, from DWM. DWM's vblank time
-/// may be the last one or the coming one, so only its phase is used.
+/// may be the last one or the coming one, so only its phase is used. An estimate: `Vsync` has
+/// the real ones once frames have been shown.
 fn vblank() -> Option<(Instant, Duration)> {
+    let (now_qpc, freq) = qpc_now()?;
     let mut info = DWM_TIMING_INFO { cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32, ..Default::default() };
-    let (mut now_qpc, mut freq) = (0i64, 0i64);
-    unsafe {
-        DwmGetCompositionTimingInfo(HWND::default(), &mut info).ok()?;
-        QueryPerformanceCounter(&mut now_qpc).ok()?;
-        QueryPerformanceFrequency(&mut freq).ok()?;
-    }
+    unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut info).ok()? };
     let now = Instant::now();
     let period_qpc = info.qpcRefreshPeriod as i64;
-    if freq <= 0 || period_qpc <= 0 {
+    if period_qpc <= 0 {
         return None;
     }
     let phase = (now_qpc - info.qpcVBlank as i64).rem_euclid(period_qpc);
     let until = Duration::from_secs_f64((period_qpc - phase) as f64 / freq as f64);
     Some((now + until, Duration::from_secs_f64(period_qpc as f64 / freq as f64)))
+}
+
+fn qpc_now() -> Option<(i64, i64)> {
+    let (mut now, mut freq) = (0i64, 0i64);
+    unsafe {
+        QueryPerformanceCounter(&mut now).ok()?;
+        QueryPerformanceFrequency(&mut freq).ok()?;
+    }
+    (freq > 0).then_some((now, freq))
+}
+
+/// The display's vblanks as DXGI's frame statistics report them: when our frames were really
+/// scanned out. DWM's estimate (`vblank`) can sit a couple of milliseconds off and drift, too
+/// coarse to keep presents clear of the moment DWM picks up the next frame.
+#[derive(Default)]
+struct Vsync {
+    /// (vblank count, its QPC time): where the measurement starts, and the latest.
+    anchor: Option<(u32, i64)>,
+    latest: Option<(u32, i64)>,
+}
+
+impl Vsync {
+    /// Vblanks to measure over before the period is trusted (half a second at 240 Hz).
+    const SPAN: u32 = 120;
+
+    fn feed(&mut self, refresh: u32, qpc: i64) {
+        if refresh == 0 || qpc <= 0 {
+            return;
+        }
+        if let Some((r, q)) = self.latest {
+            if refresh < r || qpc < q {
+                // The count went back (a new swap chain or display): start over.
+                *self = Vsync::default();
+            } else if refresh == r {
+                return;
+            }
+        }
+        self.anchor.get_or_insert((refresh, qpc));
+        self.latest = Some((refresh, qpc));
+    }
+
+    /// The next vblank after now and the refresh period: measured once there's enough to go
+    /// on and it agrees with DWM's period (the display may have changed rate), else DWM's.
+    fn next(&mut self) -> Option<(Instant, Duration)> {
+        let dwm = vblank();
+        let (Some((r0, q0)), Some((r1, q1))) = (self.anchor, self.latest) else { return dwm };
+        if r1 - r0 < Self::SPAN {
+            return dwm;
+        }
+        let (now_qpc, freq) = qpc_now()?;
+        let now = Instant::now();
+        let period = (q1 - q0) as f64 / (r1 - r0) as f64;
+        if let Some((_, p)) = dwm
+            && (period / freq as f64 / p.as_secs_f64() - 1.0).abs() > 0.02
+        {
+            self.anchor = self.latest;
+            return dwm;
+        }
+        let k = ((now_qpc - q1) as f64 / period).floor() + 1.0;
+        let until = (q1 as f64 + k * period - now_qpc as f64) / freq as f64;
+        Some((now + Duration::from_secs_f64(until.max(0.0)), Duration::from_secs_f64(period / freq as f64)))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -409,6 +474,8 @@ struct Video<'a> {
     next_out: usize,
     queue: VecDeque<Entry>,
     last_raw: Option<(Vec<u8>, RawInfo)>,
+    /// A new picture held back until the present due first has gone (see `run`).
+    deferred: Option<RawFrame>,
     spare: Spare,
     last_decode: Option<Decoding>,
     last_at: Option<Instant>,
@@ -424,11 +491,14 @@ struct Video<'a> {
     /// Test sessions: presents so far, the card frame in each slot, the picture and time of
     /// each generated frame, and what the next present is.
     presents: u64,
+    /// The display's real vblanks, from what DXGI says about our presents.
+    vsync: Vsync,
     slot_seq: [u64; 2],
     out_meta: [(u64, f32); crate::gpu::OUTS],
     meta: PresentMeta,
-    /// How long a pair's GPU work takes (smoothed).
+    /// How long a pair's GPU work takes (smoothed), and whether it's been measured yet.
     gpu_time: Duration,
+    gpu_measured: bool,
     /// Slots of the pair the motion field is for, while it has frames still to generate.
     pair: Option<(usize, usize)>,
     /// A recent vblank (or the coming one), the refresh period, and when they were read: for
@@ -494,6 +564,7 @@ fn run(shared: &VideoShared, rx: Receiver<RawFrame>, spare: Spare) -> Result<()>
         next_out: 0,
         queue: VecDeque::new(),
         last_raw: None,
+        deferred: None,
         spare,
         last_decode: None,
         last_at: None,
@@ -506,10 +577,12 @@ fn run(shared: &VideoShared, rx: Receiver<RawFrame>, spare: Spare) -> Result<()>
         started: Instant::now(),
         pending: None,
         presents: 0,
+        vsync: Vsync::default(),
         slot_seq: [0; 2],
         out_meta: [(0, 0.0); crate::gpu::OUTS],
         meta: PresentMeta::default(),
         gpu_time: GPU_GUESS,
+        gpu_measured: false,
         pair: None,
         refresh: None,
         upscaler,
@@ -541,6 +614,25 @@ fn run(shared: &VideoShared, rx: Receiver<RawFrame>, spare: Spare) -> Result<()>
             }
         };
         if let Some(raw) = msg {
+            // A new picture's GPU work (upload, decode, motion: ~3 ms at 4K) goes in the queue
+            // ahead of any present after it. A present due before that's done would miss its
+            // vblank: at 30 -> 120 the pair's last frame is due just as the next picture
+            // arrives, and 15% of them slipped a refresh (a steady stutter). So the picture
+            // waits until that present has gone; its frames come after it anyway.
+            if v.would_delay_present() {
+                if let Some(older) = v.deferred.replace(raw) {
+                    v.arrive(older)?;
+                }
+            } else {
+                if let Some(older) = v.deferred.take() {
+                    v.arrive(older)?;
+                }
+                v.arrive(raw)?;
+            }
+            continue;
+        }
+        if v.deferred.is_some() && !v.would_delay_present() {
+            let raw = v.deferred.take().expect("checked");
             v.arrive(raw)?;
             continue;
         }
@@ -560,6 +652,9 @@ fn run(shared: &VideoShared, rx: Receiver<RawFrame>, spare: Spare) -> Result<()>
             v.show(e.what, e.arrived)?;
             // The next one now, a step ahead of its time.
             v.generate(1);
+            if let Some(raw) = v.deferred.take() {
+                v.arrive(raw)?;
+            }
             continue;
         }
         std::thread::sleep((front.at - now).min(Duration::from_millis(1)));
@@ -604,8 +699,12 @@ impl Video<'_> {
         let call = Instant::now();
         self.swap.show(&self.gpu, shown, rect, mark)?;
         let meta = std::mem::take(&mut self.meta);
+        let stats = self.swap.frame_stats();
+        if let Some((_, _, sync_refresh, sync_qpc)) = stats {
+            self.vsync.feed(sync_refresh, sync_qpc);
+        }
         if telemetry::on() {
-            self.record_present(what, has_src, meta, call);
+            self.record_present(what, has_src, meta, call, stats);
         }
         self.showing = if has_src { what } else { Showing::Black };
         Ok(())
@@ -613,7 +712,14 @@ impl Video<'_> {
 
     /// Test sessions: the present just made, and the latest present DXGI says reached the
     /// screen (and at which vblank).
-    fn record_present(&self, what: Showing, has_src: bool, meta: PresentMeta, call: Instant) {
+    fn record_present(
+        &self,
+        what: Showing,
+        has_src: bool,
+        meta: PresentMeta,
+        call: Instant,
+        stats: Option<(u32, u32, u32, i64)>,
+    ) {
         let done = Instant::now();
         let (kind, seq, t) = match what {
             _ if !has_src => (0, 0, 0.0),
@@ -633,7 +739,7 @@ impl Video<'_> {
             arrived: meta.arrived,
             queued: self.queue.len() as u32,
         }));
-        if let Some((present_count, refresh, sync_refresh, sync_qpc)) = self.swap.frame_stats() {
+        if let Some((present_count, refresh, sync_refresh, sync_qpc)) = stats {
             telemetry::emit(Ev::Displayed { present_count, refresh, sync_refresh, sync_qpc });
         }
     }
@@ -660,7 +766,7 @@ impl Video<'_> {
     /// and keeps what the eye gets (a frame that misses a vblank shows a refresh late).
     fn on_screen(&mut self, now: Instant) -> Instant {
         if self.refresh.is_none_or(|(_, _, read)| now.saturating_duration_since(read) > Duration::from_millis(500)) {
-            self.refresh = vblank().map(|(v, p)| (v, p, now));
+            self.refresh = self.vsync.next().map(|(v, p)| (v, p, now));
         }
         self.note_refresh();
         let Some((v, p, _)) = self.refresh else {
@@ -716,7 +822,7 @@ impl Video<'_> {
         }
         self.shared.meter.set_gpu(smoothing.then_some(self.gpu_time));
         if self.window.since.elapsed() >= Duration::from_secs(5) {
-            if let Some((at, p)) = vblank() {
+            if let Some((at, p)) = self.vsync.next() {
                 self.refresh = Some((at, p, Instant::now()));
                 self.note_refresh();
             }
@@ -777,8 +883,16 @@ impl Video<'_> {
         }
         let took = at.elapsed();
         telemetry::emit(Ev::PairGpu { seq: *seq, gpu_us: took.as_micros() as u32 });
-        // Quick to grow (a frame shown late costs more than a little delay), slow to shrink.
-        let w = if took > self.gpu_time { 0.5 } else { 0.1 };
+        // Quick to grow (a frame shown late costs more than a little delay), slow to shrink;
+        // the first measurement replaces the guess (else the first seconds run late).
+        let w = if !self.gpu_measured {
+            1.0
+        } else if took > self.gpu_time {
+            0.5
+        } else {
+            0.1
+        };
+        self.gpu_measured = true;
         self.gpu_time = self.gpu_time.mul_f64(1.0 - w) + took.mul_f64(w);
         self.pending = None;
     }
@@ -807,6 +921,12 @@ impl Video<'_> {
             }
         };
         telemetry::emit(Ev::Capture { seq: info.seq, at: info.at, copy_us: info.copy_us, w: info.w, h: info.h, input });
+    }
+
+    /// Whether a present is due before a new picture's GPU work would be done.
+    fn would_delay_present(&self) -> bool {
+        self.shared.gpu.target.load(Ordering::Relaxed) > 0
+            && self.queue.front().is_some_and(|e| e.at < Instant::now() + self.gpu_time + DEFER_MARGIN)
     }
 
     /// Test sessions: what this card frame turned out to be.
@@ -947,7 +1067,7 @@ impl Video<'_> {
 
         // How many steps the picture's time splits into, no shorter than a refresh each.
         let span = held as f64 * self.cadence.period;
-        let timing = vblank();
+        let timing = self.vsync.next();
         if let Some((v, p)) = timing {
             self.refresh = Some((v, p, Instant::now()));
             self.note_refresh();
@@ -1003,14 +1123,13 @@ impl Video<'_> {
         let (mut first, every) = match timing {
             Some((next, period)) => {
                 let k = (step / period.as_secs_f64()).round().max(1.0) as u32;
-                // `timing` was read before the work above; step to the first vblank still ahead
-                // whose frame the GPU will have finished (with a millisecond to spare before
-                // the one after, when it's composed).
-                let mut next = next;
-                while next < now || next + period < ready + Duration::from_millis(1) {
-                    next += period;
+                // The first present: `PRESENT_PHASE` into a refresh, once the GPU has made the
+                // frame (`timing` was read before the work above).
+                let mut slot = next - period + period.mul_f64(PRESENT_PHASE);
+                while slot < now.max(ready) {
+                    slot += period;
                 }
-                (next + VBLANK_PHASE, period * k)
+                (slot, period * k)
             }
             None => (now, Duration::from_secs_f64(step)),
         };
@@ -1022,13 +1141,16 @@ impl Video<'_> {
                 backlog_cleared = true;
                 self.queue.clear();
             } else if after > first {
-                // Still busy with the last pair: carry on straight after it. A whole step or
-                // more behind (a slow pair pushed everything later), skip that many of this
-                // pair's first generated frames, so the delay doesn't stay.
+                // Still busy with the last pair: carry on after it. A whole step or more behind
+                // (a slow pair pushed everything later), skip that many of this pair's first
+                // generated frames; less than that, shorten the gap to it by whole refreshes
+                // (down to one), so the delay doesn't stay. Without this a schedule a little
+                // late stays late (test sessions: 12 ms extra for seconds after starting).
                 let behind = ((after - first).as_secs_f64() / every.as_secs_f64()) as usize;
                 skipped = behind.min(made.len()) as u32;
                 made.drain(..behind.min(made.len()));
-                first = after;
+                let refresh = timing.map_or(every, |(_, p)| p);
+                first = first.max(back.at + refresh);
             }
         }
         if telemetry::on() {

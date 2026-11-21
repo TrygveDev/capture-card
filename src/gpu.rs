@@ -580,7 +580,7 @@ struct Gen {
 }
 
 /// Counters of a pair's motion (see gpu.hlsl's `CountsIn`).
-pub const COUNTS: usize = 6;
+pub const COUNTS: usize = 8;
 
 /// Most generated frames kept at once (each one frame in size): two pairs' worth at 30 -> 240.
 pub const OUTS: usize = 14;

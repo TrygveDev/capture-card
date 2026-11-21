@@ -71,7 +71,8 @@ Texture2D<float4> FA        : register(t16);
 Texture2D<float4> FB        : register(t17);
 Texture2D<uint>   CountsIn  : register(t18); // per pair, A->B: 0 patches missed, 1 textured patches,
                                              // 2, 3 their cost and detail (the cut test), 4 level-0
-                                             // pixels that changed, 5 of those motion can't follow
+                                             // pixels that changed, 5 of those motion can't follow,
+                                             // 6 of those hidden, 7 visible but unexplained
 Texture2D<float4> Shown     : register(t19);
 Texture2D<float4> InfoIn    : register(t20);
 Texture2D<float4> FX        : register(t21); // the picture motion is measured from, in colour
@@ -464,8 +465,10 @@ void flow_snap(uint3 id : SV_DispatchThreadID) {
 // all of the frame over LOST_RAMP), the change isn't motion but a menu, a highlight jumping,
 // a screen opening. Following parts of it tears it (pieces move, the rest blends), so the whole
 // frame cross-fades. Gameplay stays under 0.35 on the test clips, menu changes are 0.65 and up.
-#define LOST_START 0.45
-#define LOST_RAMP 0.15
+// Something moving further than its own size is about half (what it uncovers is hidden): the
+// test pattern's bar sits at 0.44, so the ramp starts above that.
+#define LOST_START 0.55
+#define LOST_RAMP 0.1
 
 // x: mismatch with the opposite flow (relative, see above); y: |Y moved - X|; z: |Y unmoved - X|.
 [numthreads(8, 8, 1)]
@@ -588,8 +591,11 @@ void flow_final(uint3 id : SV_DispatchThreadID) {
     u = max(u, saturate((hidden / 49.0 - HIDDEN_START) / HIDDEN_RAMP));
     if ((fl.x & F_COUNT) && info.z > CHANGED) {
         uint old;
+        bool hidden_here = info.x > OCCLUDED;
         InterlockedAdd(Counts[int2(4, 0)], 1, old);
-        if (u > 0.5 || info.x > OCCLUDED) InterlockedAdd(Counts[int2(5, 0)], 1, old);
+        if (u > 0.5 || hidden_here) InterlockedAdd(Counts[int2(5, 0)], 1, old);
+        if (hidden_here) InterlockedAdd(Counts[int2(6, 0)], 1, old);
+        else if (u > 0.5) InterlockedAdd(Counts[int2(7, 0)], 1, old);
     }
     Out4[x] = float4(v, info.x, u);
 }

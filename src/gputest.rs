@@ -517,11 +517,14 @@ pub fn eval(clip: &Path, out_dir: &Path, skip: usize, keep: &[usize]) -> Result<
         gpu.wait_idle()?;
         gen_ms += t.elapsed().as_secs_f64() * 1000.0 / (skip - 1) as f64;
         let (a, b) = (read(&f, sa)?, read(&f, sb)?);
-        let [_, _, cost, detail, changed, lost] = f.counts(&gpu)?;
+        let [_, _, cost, detail, changed, lost, hidden, unexplained] = f.counts(&gpu)?;
+        let ch = changed.max(1) as f64;
         let mut line = format!(
-            "pair {pair:2} ({ia}->{ib}) cost/detail {:.2} lost/changed {:.2} ({changed}):",
+            "pair {pair:2} ({ia}->{ib}) cost/detail {:.2} lost/changed {:.2} hidden {:.2} unexplained {:.2} ({changed}):",
             cost as f64 / detail.max(1) as f64,
-            lost as f64 / changed.max(1) as f64
+            lost as f64 / ch,
+            hidden as f64 / ch,
+            unexplained as f64 / ch,
         );
         for j in 1..skip {
             let ts = j as f32 / skip as f32;
