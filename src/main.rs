@@ -728,9 +728,9 @@ fn icon_button(id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::Di
 }
 
 /// A small text switch: filled white when on, outlined when off.
-/// A toggle in the controls, `width` wide whatever it says (sized for its longest label), so
-/// the bar doesn't change width, and buttons don't move, as labels change.
-fn chip(id: &'static str, label: impl Into<SharedString>, on: bool, width: f32) -> gpui::Stateful<gpui::Div> {
+/// A toggle in the controls, "NAME | STATE", `width` wide whatever the state says (sized for
+/// its longest), so the bar doesn't change width, and buttons don't move, as states change.
+fn chip(id: &'static str, name: &'static str, state: String, on: bool, width: f32) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .h(px(24.))
@@ -751,7 +751,10 @@ fn chip(id: &'static str, label: impl Into<SharedString>, on: bool, width: f32) 
                 .text_color(rgba(0xffffffaa))
                 .hover(|s| s.bg(rgba(0xffffff26)))
         })
-        .child(label.into())
+        .gap(px(5.))
+        .child(name)
+        .child(div().opacity(0.45).child("|"))
+        .child(state)
 }
 
 fn divider() -> gpui::Div {
@@ -891,33 +894,23 @@ impl Render for Viewer {
         } else {
             ICON_VOLUME
         };
-        let mut mode = self.video.mode.lock().unwrap().clone();
-        // How big it's drawn, when that isn't 1:1: "85%" in a smaller window, "133% RTX" when
-        // enlarged with super resolution.
-        let (src_w, _) = self.video.control.size();
-        if !mode.is_empty() && signal && src_w > 0 {
-            let pct = (fit_w / src_w as f32 * 100.0).round();
-            if pct != 100.0 {
-                mode = format!("{mode} · {pct:.0}%");
-                if gpu && self.video.gpu.scaling() == present::Scaling::Rtx {
-                    mode.push_str(" RTX");
-                }
-            }
-        }
-        // While smoothing, show what it's doing: the game's detected rate -> the target.
+        // The capture mode, and nothing else (2160p60).
+        let mode = self.video.mode.lock().unwrap().clone();
         let smooth = self.settings.smooth;
-        let content = self.video.gpu.content_fps();
-        if smooth > 0 && content > 1.0 && content.round() < smooth as f32 && !mode.is_empty() {
-            mode = format!("{mode} · {:.0}→{smooth}", content);
-        }
 
-        let hdr_button = chip("hdr", "HDR", hdr, 38.).on_click(cx.listener(|this, _, _, cx| this.toggle_hdr(cx)));
-        let smooth_label = if smooth == 0 { "SMOOTH".to_string() } else { format!("SMOOTH {smooth}") };
-        let smooth_button =
-            chip("smooth", smooth_label, smooth > 0, 84.).on_click(cx.listener(|this, _, _, cx| this.cycle_smooth(cx)));
+        let on_off = |on: bool| if on { "ON".to_string() } else { "OFF".to_string() };
+        let hdr_button =
+            chip("hdr", "HDR", on_off(hdr), hdr, 72.).on_click(cx.listener(|this, _, _, cx| this.toggle_hdr(cx)));
+        let smooth_value = if smooth == 0 { "OFF".to_string() } else { smooth.to_string() };
+        let smooth_button = chip("smooth", "SMOOTHING", smooth_value, smooth > 0, 118.)
+            .on_click(cx.listener(|this, _, _, cx| this.cycle_smooth(cx)));
         let overlay_mode = self.settings.overlay;
-        let overlay_label = if overlay_mode == Overlay::Graph { "FPS GRAPH" } else { "FPS" };
-        let overlay_button = chip("fps", overlay_label, overlay_mode != Overlay::Off, 78.)
+        let overlay_value = match overlay_mode {
+            Overlay::Off => "OFF",
+            Overlay::Counter => "ON",
+            Overlay::Graph => "GRAPH",
+        };
+        let overlay_button = chip("fps", "FPS", overlay_value.to_string(), overlay_mode != Overlay::Off, 88.)
             .on_click(cx.listener(|this, _, _, cx| this.cycle_overlay(cx)));
         // Inside the video's top-left corner (clear of black bars).
         let overlay = (signal && overlay_mode != Overlay::Off).then(|| {
@@ -992,7 +985,7 @@ impl Render for Viewer {
                         div()
                             .id("mode")
                             .h(px(24.))
-                            .w(px(206.))
+                            .w(px(118.))
                             .px(px(6.))
                             .flex()
                             .flex_none()
