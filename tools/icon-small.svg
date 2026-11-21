@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- The same mark for 16-32 px: fewer, bolder strokes, no fade (it would blur away). -->
+  <rect x="32" y="32" width="960" height="960" rx="200" fill="#16181c"/>
+  <rect x="196" y="300" width="604" height="424" rx="60" fill="none" stroke="#ffffff" stroke-opacity="0.5" stroke-width="80"/>
+  <rect x="120" y="458" width="600" height="108" rx="10" fill="#ffffff"/>
+  <path d="M680 352 L880 512 L680 672 Z" fill="#ffffff" stroke="#ffffff" stroke-width="56" stroke-linejoin="round"/>
+</svg>

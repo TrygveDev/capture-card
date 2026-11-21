@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Passthru: a picture passing straight through, in motion. Large sizes (48 px and up). -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#24272e"/><stop offset="1" stop-color="#111316"/>
+    </linearGradient>
+    <linearGradient id="trail" x1="150" y1="0" x2="700" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#ffffff"/>
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="216" fill="url(#tile)"/>
+  <rect x="65.5" y="65.5" width="893" height="893" rx="214.5" fill="none" stroke="#ffffff" stroke-opacity="0.09" stroke-width="3"/>
+  <rect x="232" y="322" width="560" height="380" rx="64" fill="none" stroke="#ffffff" stroke-opacity="0.45" stroke-width="52"/>
+  <rect x="150" y="472" width="560" height="80" rx="4" fill="url(#trail)"/>
+  <path d="M694 386 L846 512 L694 638 Z" fill="#ffffff" stroke="#ffffff" stroke-width="44" stroke-linejoin="round"/>
+</svg>
