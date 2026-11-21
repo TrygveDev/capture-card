@@ -76,6 +76,7 @@ Texture2D<uint>   CountsIn  : register(t18); // per pair, A->B: 0 patches missed
 Texture2D<float4> Shown     : register(t19);
 Texture2D<float4> InfoIn    : register(t20);
 Texture2D<float4> FX        : register(t21); // the picture motion is measured from, in colour
+Texture2D<int2>   HwFlow    : register(t22); // hardware optical flow: full-size pixels x 32, a vector per misc.z pixels
 SamplerState Lin : register(s0);
 
 // Outputs
@@ -87,6 +88,7 @@ RWTexture2D<uint>         Counts    : register(u4);
 RWTexture2D<uint>         OutKeyA   : register(u5);
 RWTexture2D<uint>         OutKeyB   : register(u6);
 RWTexture2D<unorm float4> OutInterp : register(u7);
+RWTexture2D<unorm float>  OutLuma8  : register(u8);
 
 // ---------------------------------------------------------------------------------------------
 // Decode: YCbCr (or RGB) to display-ready sRGB, the same maths as convert.rs.
@@ -183,6 +185,54 @@ void halve(uint3 id : SV_DispatchThreadID) {
     int2 m = sz.zw - 1;
     OutLuma[id.xy] = 0.25 * (InLuma.Load(int3(min(p, m), 0)) + InLuma.Load(int3(min(p + int2(1, 0), m), 0))
                            + InLuma.Load(int3(min(p + int2(0, 1), m), 0)) + InLuma.Load(int3(min(p + 1, m), 0)));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hardware optical flow (nvof.rs): its input, and its vectors brought into the shader flow's
+// level 0, either as the flow itself (hw_dense) or as starting vectors for the patches
+// (hw_seed, then flow_patch refines them and measures the cut test as usual).
+
+// Luma, 8 bits, for the hardware: at 1/misc.y of full size (sz.xy; sz.zw is full size).
+[numthreads(8, 8, 1)]
+void luma8(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= (uint2)sz.xy)) return;
+    int s = (int)misc.y;
+    int2 p = int2(id.xy) * s;
+    int2 m = sz.zw - 1;
+    float acc = 0.0;
+    [loop] for (int j = 0; j < s; j++)
+        [loop] for (int i = 0; i < s; i++) acc += luma(InFrame.Load(int3(min(p + int2(i, j), m), 0)));
+    OutLuma8[id.xy] = acc / (float)(s * s) / 255.0;
+}
+
+// The hardware's vector at full-size position q (continuous), in full-size pixels: bilinear
+// between its grid points (gr.xy of them, misc.z of its input's pixels apart; its input is
+// 1/misc.w of full size).
+float2 hw_at(float2 q) {
+    float2 g = q / (misc.z * misc.w) - 0.5;
+    int2 i = (int2)floor(g);
+    float2 f = g - (float2)i;
+    int2 m = gr.xy - 1;
+    float2 v00 = (float2)HwFlow.Load(int3(clamp(i, int2(0, 0), m), 0));
+    float2 v10 = (float2)HwFlow.Load(int3(clamp(i + int2(1, 0), int2(0, 0), m), 0));
+    float2 v01 = (float2)HwFlow.Load(int3(clamp(i + int2(0, 1), int2(0, 0), m), 0));
+    float2 v11 = (float2)HwFlow.Load(int3(clamp(i + 1, int2(0, 0), m), 0));
+    return lerp(lerp(v00, v10, f.x), lerp(v01, v11, f.x), f.y) / 32.0 * misc.w;
+}
+
+// Level-0 flow (sz.xy) from the hardware's (misc.y full-size pixels per level-0 pixel).
+[numthreads(8, 8, 1)]
+void hw_dense(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= (uint2)sz.xy)) return;
+    Out2[id.xy] = hw_at((float2(id.xy) + 0.5) * misc.y) / misc.y;
+}
+
+// Starting vectors for level 0's patches (gr.zw of them; patch i is centred on 4i + 2).
+[numthreads(8, 8, 1)]
+void hw_seed(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= (uint2)gr.zw)) return;
+    float2 centre = float2(id.xy) * 4.0 + 2.0;
+    Out4[id.xy] = float4(hw_at(centre * misc.y) / misc.y, 0.0, 0.0);
 }
 
 // ---------------------------------------------------------------------------------------------

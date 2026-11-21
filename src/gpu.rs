@@ -79,6 +79,9 @@ struct Kernels {
     flow_final: Kernel,
     project: Kernel,
     compose: Kernel,
+    luma8: Kernel,
+    hw_dense: Kernel,
+    hw_seed: Kernel,
 }
 
 pub struct Gpu {
@@ -112,10 +115,14 @@ fn compile(entry: &str, target: &str) -> Result<Vec<u8>> {
     let target_c = format!("{target}\0");
     let mut blob: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
+    // Development: CAPTURE_CARD_HLSL=FILE compiles that file instead of the built-in shaders
+    // (tuning against recorded clips without rebuilding).
+    let file = std::env::var("CAPTURE_CARD_HLSL").ok().and_then(|p| std::fs::read_to_string(p).ok());
+    let source = file.as_deref().unwrap_or(SOURCE);
     let r = unsafe {
         D3DCompile(
-            SOURCE.as_ptr() as _,
-            SOURCE.len(),
+            source.as_ptr() as _,
+            source.len(),
             PCSTR(c"gpu.hlsl".as_ptr() as _),
             None,
             None,
@@ -180,6 +187,9 @@ impl Gpu {
             "flow_final",
             "project",
             "compose",
+            "luma8",
+            "hw_dense",
+            "hw_seed",
         ];
         let compiled: Vec<Result<Vec<u8>>> = std::thread::scope(|s| {
             let jobs: Vec<_> = cs_names
@@ -212,6 +222,9 @@ impl Gpu {
             flow_final: cs()?,
             project: cs()?,
             compose: cs()?,
+            luma8: cs()?,
+            hw_dense: cs()?,
+            hw_seed: cs()?,
         };
         let (vs_code, ps_code) = (code.next().context("vs")?, code.next().context("ps")?);
         let (mut vs, mut ps) = (None, None);
@@ -257,9 +270,17 @@ impl Gpu {
     }
 
     pub fn tex(&self, w: u32, h: u32, format: DXGI_FORMAT, uav: bool) -> Result<Tex> {
+        self.tex_bound(w, h, format, uav, false)
+    }
+
+    /// `tex`, also bindable as a render target (what the optical flow API asks for).
+    fn tex_bound(&self, w: u32, h: u32, format: DXGI_FORMAT, uav: bool, rt: bool) -> Result<Tex> {
         let mut bind = D3D11_BIND_SHADER_RESOURCE.0 as u32;
         if uav {
             bind |= D3D11_BIND_UNORDERED_ACCESS.0 as u32;
+        }
+        if rt {
+            bind |= D3D11_BIND_RENDER_TARGET.0 as u32;
         }
         let desc = D3D11_TEXTURE2D_DESC {
             Width: w.max(1),
@@ -577,6 +598,8 @@ struct Gen {
     counts: Tex,
     /// Copies of `counts` on their way back to the CPU (test sessions), and whose they are.
     readback: Vec<(ID3D11Texture2D, Option<u64>)>,
+    /// Hardware optical flow, when it's the method and available.
+    hw: Option<Hw>,
 }
 
 /// Counters of a pair's motion (see gpu.hlsl's `CountsIn`).
@@ -584,6 +607,75 @@ pub const COUNTS: usize = 8;
 
 /// Most generated frames kept at once (each one frame in size): two pairs' worth at 30 -> 240.
 pub const OUTS: usize = 14;
+
+/// Where frame generation's motion comes from.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum FlowMethod {
+    /// The shader pyramid in gpu.hlsl (any GPU).
+    Shader,
+    /// NVIDIA's optical flow hardware (nvof.rs), used as it comes.
+    Hardware,
+    /// The hardware's vectors refined by the shader's last level.
+    HardwareRefined,
+}
+
+/// The method to use: the hardware if `hardware` (the setting), else the shader;
+/// `CAPTURE_CARD_FLOW=shader|hw|hw-refined` overrides it (for comparing). Hardware falls back
+/// to the shader where it isn't available.
+///
+/// An experiment, off unless asked for. Measured on real 4K capture (10 clips of play, a
+/// picture regenerated from its neighbours): the hardware at its medium preset scores 25.71 dB
+/// against the shader's 25.51 and its worst spots are 6% better (163 against 174), but it takes
+/// 8.7 ms a pair against 2.2. D3D11 runs it in the same queue as the presents, so live at
+/// 30 -> 120 on 240 Hz only 75% of frames kept the steady two refreshes (shader: 99.5%) and
+/// latency rose 10 ms. Worth it only with its own queue and cross-queue synchronisation.
+pub fn flow_method(hardware: bool) -> FlowMethod {
+    match std::env::var("CAPTURE_CARD_FLOW").as_deref() {
+        Ok("hw") => FlowMethod::Hardware,
+        Ok("hw-refined") => FlowMethod::HardwareRefined,
+        Ok("shader") => FlowMethod::Shader,
+        _ if hardware => FlowMethod::Hardware,
+        _ => FlowMethod::Shader,
+    }
+}
+
+/// The hardware optical flow session and its textures: 8-bit luma per slot (its input), and
+/// its vectors both ways.
+struct Hw {
+    flow: crate::nvof::Flow,
+    luma: [Tex; 2],
+    input: [crate::nvof::Buffer; 2],
+    out: [Tex; 2],
+    output: [crate::nvof::Buffer; 2],
+    /// Level 0's patch starting vectors made from them.
+    seed0: Tex,
+    refine: bool,
+    /// The slot last measured to (the next pair continues from it).
+    last_to: Option<usize>,
+    /// Its input is 1/div of the picture's size.
+    div: u32,
+    size: (u32, u32),
+}
+
+impl Hw {
+    fn new(gpu: &Gpu, w: u32, h: u32, scale0: u32, patches0: (u32, u32), refine: bool) -> Result<Hw> {
+        // Experiments: CAPTURE_CARD_NVOF_PERF (5 slow/best, 10, 20 fast) and _DIV (input at
+        // 1/DIV size).
+        let env = |k: &str, d: u32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let (perf, div) = (env("CAPTURE_CARD_NVOF_PERF", 10), env("CAPTURE_CARD_NVOF_DIV", 1).max(1));
+        let (w, h) = (w.div_ceil(div), h.div_ceil(div));
+        // A vector per level-0 pixel at most (finer would only be averaged away).
+        let mut flow = crate::nvof::Flow::new(&gpu.device, &gpu.ctx, (w, h), (scale0 / div).max(1), perf)?;
+        let luma = [gpu.tex_bound(w, h, DXGI_FORMAT_R8_UNORM, true, true)?, gpu.tex_bound(w, h, DXGI_FORMAT_R8_UNORM, true, true)?];
+        let (gw, gh) = (w.div_ceil(flow.grid), h.div_ceil(flow.grid));
+        let out = [gpu.tex_bound(gw, gh, DXGI_FORMAT_R16G16_SINT, true, true)?, gpu.tex_bound(gw, gh, DXGI_FORMAT_R16G16_SINT, true, true)?];
+        let res = |t: &Tex| -> Result<ID3D11Resource> { Ok(t.tex.cast()?) };
+        let input = [flow.register(&res(&luma[0])?)?, flow.register(&res(&luma[1])?)?];
+        let output = [flow.register(&res(&out[0])?)?, flow.register(&res(&out[1])?)?];
+        let seed0 = gpu.tex(patches0.0, patches0.1, DXGI_FORMAT_R32G32B32A32_FLOAT, true)?;
+        Ok(Hw { flow, luma, input, out, output, seed0, refine, last_to: None, div, size: (w, h) })
+    }
+}
 
 /// Lucas-Kanade steps per patch at level `l`. The finest level starts close (and is snapped to
 /// edges afterwards): on the test clips 4 steps there score the same as 10, 0 a little worse.
@@ -600,19 +692,23 @@ const COARSEST_WIDTH: u32 = 100;
 const QUARTER_ABOVE: u32 = 2560 * 1440;
 
 fn level0_scale(w: u32, h: u32) -> u32 {
+    // Experiments: CAPTURE_CARD_SCALE0=2|4.
+    if let Some(s) = std::env::var("CAPTURE_CARD_SCALE0").ok().and_then(|v| v.parse().ok()).filter(|&s| s == 2 || s == 4) {
+        return s;
+    }
     if w * h > QUARTER_ABOVE { 4 } else { 2 }
 }
 
 impl Frames {
     /// With everything for frame generation, and all `OUTS` generated frames (the tests).
     pub fn new(gpu: &Gpu, w: u32, h: u32, layout: Layout) -> Result<Frames> {
-        let mut f = Frames::with(gpu, w, h, layout, true)?;
+        let mut f = Frames::with(gpu, w, h, layout, true, flow_method(false))?;
         f.ensure_outs(gpu, OUTS)?;
         Ok(f)
     }
 
     /// `fg`: with what frame generation needs (pyramids, flow), but no generated frames yet.
-    pub fn with(gpu: &Gpu, w: u32, h: u32, layout: Layout, fg: bool) -> Result<Frames> {
+    pub fn with(gpu: &Gpu, w: u32, h: u32, layout: Layout, fg: bool, method: FlowMethod) -> Result<Frames> {
         let input = match layout {
             Layout::Nv12 => {
                 vec![gpu.tex(w, h, DXGI_FORMAT_R8_UNORM, false)?, gpu.tex(w / 2, h / 2, DXGI_FORMAT_R8G8_UNORM, false)?]
@@ -639,13 +735,32 @@ impl Frames {
             })
         };
         let slots = [slot()?, slot()?];
-        let fg = if fg { Some(Gen::new(gpu, w, h, &planes, &patches)?) } else { None };
+        let mut fg = if fg { Some(Gen::new(gpu, w, h, &planes, &patches)?) } else { None };
+        if let Some(g) = fg.as_mut() {
+            if method != FlowMethod::Shader {
+                match Hw::new(gpu, w, h, scale0, patches[0], method == FlowMethod::HardwareRefined) {
+                    Ok(hw) => {
+                        crate::log::line(&format!(
+                            "gpu: hardware optical flow ({method:?}), a vector per {} pixels",
+                            hw.flow.grid
+                        ));
+                        g.hw = Some(hw);
+                    }
+                    Err(e) => crate::log::line(&format!("gpu: no hardware optical flow ({e:#}); using the shader")),
+                }
+            }
+        }
         Ok(Frames { w, h, layout, scale0, input, slots, planes, patches, fg, outs: Vec::new() })
     }
 
     /// Whether this was made with frame generation.
     pub fn has_gen(&self) -> bool {
         self.fg.is_some()
+    }
+
+    /// Whether motion comes from the optical flow hardware.
+    pub fn hardware_flow(&self) -> bool {
+        self.fg.as_ref().is_some_and(|g| g.hw.is_some())
     }
 
     /// Makes sure there are at least `n` generated frames (at most `OUTS`).
@@ -689,6 +804,7 @@ impl Gen {
             keys: [gpu.tex(w, h, DXGI_FORMAT_R32_UINT, true)?, gpu.tex(w, h, DXGI_FORMAT_R32_UINT, true)?],
             counts: gpu.tex(COUNTS as u32, 1, DXGI_FORMAT_R32_UINT, true)?,
             readback: Vec::new(),
+            hw: None,
         })
     }
 }
@@ -776,6 +892,15 @@ impl Frames {
             }
             above = (pw, ph);
         }
+        if let Some(hw) = self.fg.as_ref().and_then(|g| g.hw.as_ref()) {
+            let (lw, lh) = hw.size;
+            let p = Params {
+                sz: [lw as i32, lh as i32, self.w as i32, self.h as i32],
+                misc: [0.0, hw.div as f32, 0.0, 0.0],
+                ..Default::default()
+            };
+            gpu.run(&gpu.k.luma8, &p, &[(3, &s.frame)], &[(8, &hw.luma[slot])], (groups(lw, 8), groups(lh, 8)));
+        }
     }
 
     /// Measures motion between slots `a` and `b` (both decoded with pyramids), both ways.
@@ -788,7 +913,64 @@ impl Frames {
         let pair = |dir: usize| {
             if dir == 0 { (&self.slots[a], &self.slots[b]) } else { (&self.slots[b], &self.slots[a]) }
         };
+        let hw_ok = match fg.hw.as_mut() {
+            Some(hw) => {
+                let continuing = hw.last_to == Some(a);
+                hw.last_to = Some(b);
+                match hw.flow.run(hw.input[a], hw.input[b], hw.output[0], hw.output[1], continuing) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        crate::log::line(&format!("gpu: hardware optical flow failed ({e:#}); using the shader"));
+                        fg.hw = None;
+                        false
+                    }
+                }
+            }
+            None => false,
+        };
+        if hw_ok && let Some(hw) = fg.hw.as_ref() {
+            let (pw, ph) = self.planes[0];
+            let (gw, gh) = self.patches[0];
+            let (fw, fh) = (hw.size.0.div_ceil(hw.flow.grid), hw.size.1.div_ceil(hw.flow.grid));
+            for dir in 0..2 {
+                let (sx, sy) = pair(dir);
+                let p = Params {
+                    sz: [pw as i32, ph as i32, 0, 0],
+                    gr: [fw as i32, fh as i32, gw as i32, gh as i32],
+                    misc: [0.0, self.scale0 as f32, hw.flow.grid as f32, hw.div as f32],
+                    ..Default::default()
+                };
+                let g = (groups(pw, 8), groups(ph, 8));
+                let flow = [(22, &hw.out[dir])];
+                gpu.run(&gpu.k.hw_seed, &p, &flow, &[(2, &hw.seed0)], (groups(gw, 8), groups(gh, 8)));
+                // The patches from those starting vectors: refined (or not), and measured for
+                // the cut test either way.
+                let mut pp = Params {
+                    sz: [pw as i32, ph as i32, 0, 0],
+                    gr: [gw as i32, gh as i32, 0, 0],
+                    fl: [F_SEED, 0, if hw.refine { lk_steps(0) } else { 0 }, 0],
+                    ..Default::default()
+                };
+                if dir == 0 {
+                    pp.fl[0] |= F_COUNT;
+                }
+                let luma = [(5, &sx.luma[0]), (6, &sy.luma[0])];
+                if hw.refine || dir == 0 {
+                    let srvs = [luma[0], luma[1], (9, &hw.seed0)];
+                    gpu.run(&gpu.k.flow_patch, &pp, &srvs, &[(2, &fg.patch[0]), (4, &fg.counts)], (gw, gh));
+                }
+                if hw.refine {
+                    gpu.run(&gpu.k.flow_dense, &pp, &[luma[0], luma[1], (9, &fg.patch[0])], &[(3, &fg.rough[0])], g);
+                    gpu.run(&gpu.k.flow_smooth, &pp, &[(10, &fg.rough[0])], &[(3, &fg.flow[cur][dir][0])], g);
+                } else {
+                    gpu.run(&gpu.k.hw_dense, &p, &flow, &[(3, &fg.flow[cur][dir][0])], g);
+                }
+            }
+        }
         for dir in 0..2 {
+            if hw_ok {
+                break;
+            }
             let (sx, sy) = pair(dir);
             for l in (0..n).rev() {
                 let (pw, ph) = self.planes[l];
@@ -856,6 +1038,9 @@ impl Frames {
     pub fn forget_motion(&mut self) {
         if let Some(fg) = self.fg.as_mut() {
             fg.temporal = false;
+            if let Some(hw) = fg.hw.as_mut() {
+                hw.last_to = None;
+            }
         }
     }
 

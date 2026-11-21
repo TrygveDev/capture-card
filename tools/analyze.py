@@ -136,6 +136,10 @@ def fmt(v, digits=1, unit=""):
 # ffmpeg
 
 
+# Decode videos on the GPU where ffmpeg can (several times faster for the 240 fps recordings).
+HWACCEL = ["-hwaccel", "auto"]
+
+
 def tool(name: str) -> str | None:
     return shutil.which(name)
 
@@ -182,7 +186,7 @@ def decode_marks(video: Path) -> list[tuple[float, int | None]]:
     rows = MARK_H
     # Every frame as stored: raw output would otherwise be resampled to a constant rate
     # (frames repeated or dropped), and the n-th frame read wouldn't be the file's n-th.
-    cmd = [tool("ffmpeg"), "-v", "error", "-i", str(video), "-vf",
+    cmd = [tool("ffmpeg"), "-v", "error", *HWACCEL, "-i", str(video), "-vf",
            f"crop={STRIP_W}:{rows}:0:0,format=gray", "-fps_mode", "passthrough", "-f", "rawvideo", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     size = STRIP_W * rows
@@ -222,7 +226,7 @@ def grab(video: Path, t0: float, t1: float, out: Path, width=480, tile=None) -> 
     vf = f"select='between(t\\,{t0 - EPS:.6f}\\,{t1 + EPS:.6f})',scale={width}:-2"
     if n > 1:
         vf += f",tile={n}x1:padding=4:color=0x202020"
-    r = run([tool("ffmpeg"), "-v", "error", "-y", "-ss", f"{max(0.0, t0 - 1.0):.6f}", "-copyts", "-i", str(video),
+    r = run([tool("ffmpeg"), "-v", "error", "-y", *HWACCEL, "-ss", f"{max(0.0, t0 - 1.0):.6f}", "-copyts", "-i", str(video),
              "-vf", vf, "-fps_mode", "passthrough", "-frames:v", "1", "-q:v", "4", str(out)])
     return r.returncode == 0 and out.exists()
 
@@ -521,21 +525,32 @@ def incidents(s: Session, a: dict, present_rows: list) -> list[dict]:
 # Thumbnails
 
 
+def video_rate(video: Path) -> float | None:
+    """A video's nominal frame rate (the input videos are constant rate: frame n at n / rate)."""
+    out = run([tool("ffprobe"), "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate",
+               "-of", "csv=p=0", str(video)], text=True).stdout.strip()
+    try:
+        num, den = out.split("/")
+        return float(num) / float(den)
+    except ValueError:
+        return None
+
+
 def input_video_for(s: Session, seq: int):
-    """(file, time in it) of a card frame in the input video."""
+    """(file, time in it, rate) of a card frame in the input video."""
     r = next((c for c in s.capture if c["seq"] == seq), None)
     if not r or r["input_frame"] is None:
         return None
     video = s.dir / f"input_{r['input_segment']:03d}.mkv"
-    fps = None
-    for e in s.events:
-        if e["kind"] == "input_segment" and str(e["detail"]).startswith(video.name):
-            try:
-                fps = float(str(e["detail"]).rsplit("@", 1)[1])
-            except (IndexError, ValueError):
-                pass
+    if not video.exists():
+        return None
+    if not hasattr(s, "_rates"):
+        s._rates = {}
+    if video not in s._rates:
+        s._rates[video] = video_rate(video)
+    fps = s._rates[video]
     if not fps:
-        fps = 1000 / statistics.median(b["t_us"] / 1000 - a_["t_us"] / 1000 for a_, b in zip(s.capture, s.capture[1:]))
+        return None
     return video, r["input_frame"] / fps, fps
 
 

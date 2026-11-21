@@ -107,6 +107,10 @@ pub struct Shared {
     pub rtx: AtomicBool,
     /// How the last frame was scaled (a `Scaling`).
     pub scaling: AtomicU8,
+    /// Measure motion with the optical flow hardware where available (an experiment, see
+    /// `gpu::flow_method`), and whether it's in use: 0 not smoothing yet, 1 shader, 2 hardware.
+    pub hw_flow: AtomicBool,
+    pub flow_in_use: AtomicU8,
     /// The display's refresh rate in whole Hz (0 = not known yet).
     pub refresh_hz: AtomicU32,
 }
@@ -124,7 +128,7 @@ pub enum Scaling {
 }
 
 impl Shared {
-    pub fn new(target: u32, stats: bool, rtx: bool) -> Self {
+    pub fn new(target: u32, stats: bool, rtx: bool, hw_flow: bool) -> Self {
         Shared {
             target: AtomicU32::new(target),
             content_fps: AtomicU32::new(0),
@@ -134,6 +138,8 @@ impl Shared {
             summary: Mutex::new(String::new()),
             rtx: AtomicBool::new(rtx),
             scaling: AtomicU8::new(Scaling::NotUp as u8),
+            hw_flow: AtomicBool::new(hw_flow),
+            flow_in_use: AtomicU8::new(0),
             refresh_hz: AtomicU32::new(0),
         }
     }
@@ -502,6 +508,8 @@ struct Video<'a> {
     gpu: Gpu,
     swap: Swap,
     frames: Option<Frames>,
+    /// The hardware flow setting `frames` was made with.
+    made_hw_flow: bool,
     showing: Showing,
     /// Slot the next decode goes into.
     next_slot: usize,
@@ -595,6 +603,7 @@ fn run(shared: &VideoShared, rx: Receiver<RawFrame>, spare: Spare) -> Result<()>
         gpu,
         swap,
         frames: None,
+        made_hw_flow: false,
         showing: Showing::Black,
         next_slot: 0,
         key: None,
@@ -989,9 +998,11 @@ impl Video<'_> {
         // Frame generation's textures exist only while it's on (several hundred megabytes at
         // 4K), so turning it on or off remakes them like a new format.
         let smoothing = target > 0;
+        // So does switching how motion is measured.
+        let hw_flow = self.shared.gpu.hw_flow.load(Ordering::Relaxed);
         let new_format = self.frames.as_ref().is_none_or(|f| {
             (f.w, f.h, f.layout, f.has_gen()) != (raw.w, raw.h, raw.decode.layout, smoothing)
-        });
+        }) || (smoothing && self.made_hw_flow != hw_flow);
         if new_format {
             telemetry::note("frames", || {
                 let fg = if smoothing { "on" } else { "off" };
@@ -1003,7 +1014,12 @@ impl Video<'_> {
             self.showing = Showing::Black;
             self.next_out = 0;
             self.frames = None;
-            self.frames = Some(Frames::with(&self.gpu, raw.w, raw.h, raw.decode.layout, smoothing)?);
+            let method = crate::gpu::flow_method(hw_flow);
+            let frames = Frames::with(&self.gpu, raw.w, raw.h, raw.decode.layout, smoothing, method)?;
+            let in_use = if !smoothing { 0 } else if frames.hardware_flow() { 2 } else { 1 };
+            self.shared.gpu.flow_in_use.store(in_use, Ordering::Relaxed);
+            self.made_hw_flow = hw_flow;
+            self.frames = Some(frames);
             let spare = self.spare.clone();
             telemetry::input_format((raw.w, raw.h, raw.decode.layout), raw.fps, || Arc::new(move |b| spare.give(b)));
         }

@@ -317,6 +317,8 @@ pub fn start(opts: &Options, ctx: SessionContext) -> Result<PathBuf> {
     let session = Session::create(&dir, info)?;
     let _ = h.tx.send(Msg::Start(Box::new(session)));
     let hint = INPUT_HINT.lock().unwrap().clone();
+    // Recording starts here so the input segment's note (made as it opens) is kept.
+    h.on.store(true, Ordering::Release);
     {
         let mut s = h.state.lock().unwrap();
         s.dir = Some(dir.clone());
@@ -330,7 +332,6 @@ pub fn start(opts: &Options, ctx: SessionContext) -> Result<PathBuf> {
         }
     }
     h.marks.store(recording_output, Ordering::Release);
-    h.on.store(true, Ordering::Release);
     for (kind, detail) in notes {
         emit(Ev::Note { at: Instant::now(), kind, detail });
     }

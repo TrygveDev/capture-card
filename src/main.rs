@@ -7,6 +7,7 @@ mod gputest;
 mod install;
 mod log;
 mod meter;
+mod nvof;
 mod overlay;
 mod present;
 mod settings;
@@ -1298,7 +1299,7 @@ fn main() {
         hdr: AtomicBool::new(settings.hdr),
         display_w: AtomicU32::new(0),
         meter: meter::Meter::new(),
-        gpu: present::Shared::new(settings.smooth, args.stats, settings.rtx),
+        gpu: present::Shared::new(settings.smooth, args.stats, settings.rtx, false),
         control: video::Control::default(),
     });
     // `--mode` for this run, else the one picked in the menu.
