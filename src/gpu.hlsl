@@ -436,6 +436,17 @@ void flow_snap(uint3 id : SV_DispatchThreadID) {
 // Levels of difference per pixel motion may leave unexplained before the area counts as
 // unreliable at all.
 #define UNEXPLAINED 1.5
+// Motion leaving more than this share of the change that standing still leaves (ramping to
+// fully unreliable over the next RATIO_RAMP) isn't motion: a menu highlight jumping, text
+// changing, a dissolve. Following it scatters pieces of the old picture.
+#define RATIO_START 0.4
+#define RATIO_RAMP 0.3
+// Hidden pixels come in bands beside moving edges. Where more than HIDDEN_START of a 31x31
+// window (level-0 pixels, sampled 5 apart) is hidden, ramping over HIDDEN_RAMP, nothing
+// matched at all (a screen changing in place), so blend.
+#define HIDDEN_STEP 5
+#define HIDDEN_START 0.7
+#define HIDDEN_RAMP 0.2
 
 // x: mismatch with the opposite flow (relative, see above); y: |Y moved - X|; z: |Y unmoved - X|.
 [numthreads(8, 8, 1)]
@@ -519,7 +530,8 @@ void flow_fill(uint3 id : SV_DispatchThreadID) {
 
 // Hidden pixels: the median of the filled motion around them (3x3 samples 3 apart), so a hidden area goes with
 // one side as a whole instead of pixel by pixel. Unreliability: around each pixel, how much of
-// the change motion leaves unexplained compared with standing still.
+// the change motion leaves unexplained compared with standing still, and whether the area is
+// mostly hidden (no match at all).
 [numthreads(8, 8, 1)]
 void flow_final(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= (uint2)sz.xy)) return;
@@ -548,6 +560,13 @@ void flow_final(uint3 id : SV_DispatchThreadID) {
     float smc = acc.x / 36.0;
     float s0 = acc.y / 36.0;
     float u = saturate((smc - 0.6 * s0 - UNEXPLAINED) / (0.3 * s0 + 3.0));
+    u = max(u, saturate((smc / max(s0, 1e-3) - RATIO_START) / RATIO_RAMP) * saturate((smc - UNEXPLAINED) / 2.0));
+    float hidden = 0.0;
+    [loop] for (int k3 = 0; k3 < 49; k3++) {
+        int2 n = clamp(x + int2(k3 % 7 - 3, k3 / 7 - 3) * HIDDEN_STEP, int2(0, 0), m);
+        hidden += InfoIn.Load(int3(n, 0)).x > OCCLUDED ? 1.0 : 0.0;
+    }
+    u = max(u, saturate((hidden / 49.0 - HIDDEN_START) / HIDDEN_RAMP));
     Out4[x] = float4(v, info.x, u);
 }
 

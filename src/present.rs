@@ -769,7 +769,10 @@ impl Video<'_> {
             if let Some(fps) = self.cadence.content_fps() {
                 self.shared.gpu.content_fps.store(fps.to_bits(), Ordering::Relaxed);
             }
-            Some(held)
+            // The first change after a still picture is usually a reaction to input (moving
+            // through a menu, opening the map): show it now instead of a frame's time later,
+            // and don't invent motion into it. Smoothing picks up again from the next one.
+            if n > MAX_CADENCE { None } else { Some(held) }
         };
         let (Some(a), Some(held)) = (prev_key, held) else {
             if let Some(f) = &mut self.frames {
