@@ -32,6 +32,7 @@ const F_BLACK: u32 = 8;
 const F_SEED: u32 = 16;
 const F_COUNT: u32 = 32;
 const F_MARK: u32 = 64;
+const F_PROP: u32 = 128;
 
 /// The constant buffer every pass reads (gpu.hlsl's `Params`).
 #[repr(C)]
@@ -585,6 +586,8 @@ pub struct Frames {
 struct Gen {
     seed: Tex,
     patch: Vec<Tex>,
+    /// The patches after propagation (see `flow_patch`).
+    spread: Vec<Tex>,
     rough: Vec<Tex>,
     /// Dense flow per [set][direction][level]; the sets alternate so last pair's survives.
     flow: [[Vec<Tex>; 2]; 2],
@@ -791,6 +794,7 @@ impl Gen {
         Ok(Gen {
             seed: gpu.tex(coarsest.0, coarsest.1, DXGI_FORMAT_R32G32B32A32_FLOAT, true)?,
             patch: per_level(gpu, patches, DXGI_FORMAT_R32G32B32A32_FLOAT)?,
+            spread: per_level(gpu, patches, DXGI_FORMAT_R32G32B32A32_FLOAT)?,
             rough: per_level(gpu, planes, DXGI_FORMAT_R32G32_FLOAT)?,
             flow: [flows()?, flows()?],
             set: 0,
@@ -967,12 +971,14 @@ impl Frames {
                 }
             }
         }
-        for dir in 0..2 {
+        // Coarse to fine, both directions per level: each patch also tries the opposite
+        // direction's motion (B->A at the coarser level for A->B, A->B at this level for B->A).
+        for l in (0..n).rev() {
             if hw_ok {
                 break;
             }
-            let (sx, sy) = pair(dir);
-            for l in (0..n).rev() {
+            for dir in 0..2 {
+                let (sx, sy) = pair(dir);
                 let (pw, ph) = self.planes[l];
                 let (gw, gh) = self.patches[l];
                 let coarser = self.planes.get(l + 1).copied().unwrap_or((1, 1));
@@ -995,11 +1001,32 @@ impl Frames {
                     if l == 0 && dir == 0 {
                         p.fl[0] |= F_COUNT;
                     }
-                    let srvs = [luma[0], luma[1], (7, &fg.flow[cur][dir][l + 1]), (8, &fg.flow[prev][dir][l])];
+                    let other = if dir == 1 { &fg.flow[cur][0][l] } else { &fg.flow[cur][1][l + 1] };
+                    p.fl[3] = if dir == 1 { 1 } else { 2 };
+                    let srvs = [
+                        luma[0],
+                        luma[1],
+                        (7, &fg.flow[cur][dir][l + 1]),
+                        (8, &fg.flow[prev][dir][l]),
+                        (11, other),
+                    ];
                     gpu.run(&gpu.k.flow_patch, &p, &srvs, &[(2, &fg.patch[l]), (4, &fg.counts)], pg);
                 }
+                // Propagation: each patch tries its neighbours' vectors (no Lucas-Kanade steps:
+                // those vectors are refined already). Between the coarsest level (searched in
+                // full) and level 0 (where it costs most and gains least), so a good match
+                // spreads before the next level starts from it.
+                let spread = l != 0 && l != n - 1;
+                let pp = Params { fl: [(p.fl[0] & !F_SEED) | F_PROP, 0, 0, 0], ..p };
+                let patches = if spread {
+                    let srvs = [luma[0], luma[1], (9, &fg.patch[l])];
+                    gpu.run(&gpu.k.flow_patch, &pp, &srvs, &[(2, &fg.spread[l]), (4, &fg.counts)], pg);
+                    &fg.spread[l]
+                } else {
+                    &fg.patch[l]
+                };
                 let g = (groups(pw, 8), groups(ph, 8));
-                gpu.run(&gpu.k.flow_dense, &p, &[luma[0], luma[1], (9, &fg.patch[l])], &[(3, &fg.rough[l])], g);
+                gpu.run(&gpu.k.flow_dense, &p, &[luma[0], luma[1], (9, patches)], &[(3, &fg.rough[l])], g);
                 gpu.run(&gpu.k.flow_smooth, &p, &[(10, &fg.rough[l])], &[(3, &fg.flow[cur][dir][l])], g);
             }
         }

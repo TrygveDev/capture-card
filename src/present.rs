@@ -43,6 +43,17 @@ const SIGNAL_TIMEOUT: Duration = Duration::from_millis(1000);
 const PRESENT_PHASE: f64 = 0.3;
 /// A new picture waits while a present is due within its GPU work plus this (see `run`).
 const DEFER_MARGIN: Duration = Duration::from_millis(2);
+/// The delay ratchet. Smoothing shows a picture after its in-between frames, so the last pair's
+/// picture is on screen shortly before the next one arrives. If it's still waiting when the
+/// next arrives (a late picture, an early one, a slow pair), the newcomer waits for it, starts
+/// later, and its picture shows later still: every pair after it inherits the delay, and
+/// nothing ever took it back (36.5 ms from arrival to screen in a 4K 30 -> 120 session where
+/// 31.5 is possible). So a picture that had to wait this long has its pair's last interval
+/// shortened by a refresh, which brings the schedule back; at most once per `SHORTEN_EVERY`, so
+/// a GPU too slow for the shorter delay doesn't get uneven pacing out of it. Test pattern 30 on
+/// 60 -> 120 at 240 Hz: 38.3 ms -> 33.6 ms to the screen, one interval in ~500 a refresh short.
+const WAITED: Duration = Duration::from_micros(1500);
+const SHORTEN_EVERY: Duration = Duration::from_secs(3);
 /// How long a pair's GPU work (motion and its generated frames) is assumed to take before
 /// it has been measured.
 const GPU_GUESS: Duration = Duration::from_millis(8);
@@ -548,6 +559,8 @@ struct Video<'a> {
     /// How long a pair's GPU work takes (smoothed), and whether it's been measured yet.
     gpu_time: Duration,
     gpu_measured: bool,
+    /// When a pair was last shortened against the delay ratchet (see `WAITED`).
+    shortened: Option<Instant>,
     /// Slots of the pair the motion field is for, while it has frames still to generate.
     pair: Option<(usize, usize)>,
     /// A recent vblank (or the coming one), the refresh period, and when they were read: for
@@ -633,6 +646,7 @@ fn run(shared: &VideoShared, rx: Receiver<RawFrame>, spare: Spare) -> Result<()>
         meta: PresentMeta::default(),
         gpu_time: GPU_GUESS,
         gpu_measured: false,
+        shortened: None,
         pair: None,
         refresh: None,
         upscaler,
@@ -1227,10 +1241,22 @@ impl Video<'_> {
             }));
         }
         let last = made.len() as u32;
+        let mut real_at = first + every * last;
+        // Waited behind the last pair's picture: show this one a refresh early (see `WAITED`).
+        // Only where an interval is two refreshes or more, so none gets shorter than one.
+        if let Some((_, period)) = timing
+            && now.saturating_duration_since(raw.at) > WAITED
+            && every >= period * 2
+            && self.shortened.is_none_or(|t| now.saturating_duration_since(t) >= SHORTEN_EVERY)
+        {
+            real_at -= period;
+            self.shortened = Some(now);
+            telemetry::note("pacing", || format!("picture {} shown a refresh early (it waited)", raw.seq));
+        }
         for (j, what) in made.into_iter().enumerate() {
             self.queue.push_back(Entry { at: first + every * j as u32, what, arrived: None });
         }
-        self.queue.push_back(Entry { at: first + every * last, what: Showing::Slot(slot), arrived: Some(raw.at) });
+        self.queue.push_back(Entry { at: real_at, what: Showing::Slot(slot), arrived: Some(raw.at) });
         Ok(())
     }
 }

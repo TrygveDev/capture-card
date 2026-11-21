@@ -37,6 +37,7 @@ cbuffer Params : register(b0) {
 #define F_SEED 16
 #define F_COUNT 32
 #define F_MARK 64
+#define F_PROP 128
 
 // Test sessions recording the screen: a barcode of the present's number (fl.w, 16 bits) in the
 // top-left corner, so each frame of the recording maps back to the present that made it.
@@ -242,7 +243,7 @@ void hw_seed(uint3 id : SV_DispatchThreadID) {
 #define FULL 10        // coarsest level: every whole vector within +-FULL
 // Lucas-Kanade steps per patch come in fl.z (fewer at the finest level, which starts close).
 #define LK_REG 64.0    // keeps flat patches from wandering (gradient^2 units, over the patch)
-#define LAMBDA 0.25    // candidate choice: cost per pixel of straying from the coarser level
+#define LAMBDA 0.5     // candidate choice: cost per pixel of straying from the coarser level
 
 float lx(int2 p) {
     return LX.Load(int3(clamp(p, int2(0, 0), sz.xy - 1), 0));
@@ -338,8 +339,24 @@ void flow_patch(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : S
         v0 = PatchIn.Load(int3(pi, 0)).xy;
     } else {
         float2 centre = float2(o) + 4.0;
-        float2 base = coarse_at(centre);
         float2 c[8];
+        float2 base;
+        bool prop = (fl.x & F_PROP) != 0;
+        if (prop) {
+        // Propagation, a second pass at a level: the patch's own vector and its neighbours'
+        // (a good match spreads to patches that started from a bad guess).
+        int2 m = gr.xy - 1;
+        c[0] = PatchIn.Load(int3(pi, 0)).xy;
+        c[1] = PatchIn.Load(int3(clamp(pi + int2(-1, 0), int2(0, 0), m), 0)).xy;
+        c[2] = PatchIn.Load(int3(clamp(pi + int2(1, 0), int2(0, 0), m), 0)).xy;
+        c[3] = PatchIn.Load(int3(clamp(pi + int2(0, -1), int2(0, 0), m), 0)).xy;
+        c[4] = PatchIn.Load(int3(clamp(pi + int2(0, 1), int2(0, 0), m), 0)).xy;
+        c[5] = PatchIn.Load(int3(clamp(pi + int2(-2, 0), int2(0, 0), m), 0)).xy;
+        c[6] = PatchIn.Load(int3(clamp(pi + int2(2, 0), int2(0, 0), m), 0)).xy;
+        c[7] = PatchIn.Load(int3(clamp(pi + int2(0, 2), int2(0, 0), m), 0)).xy;
+        base = c[0];
+        } else {
+        base = coarse_at(centre);
         c[0] = base;
         c[1] = coarse_at(centre + float2(-8.0, -8.0));
         c[2] = coarse_at(centre + float2(8.0, -8.0));
@@ -347,7 +364,14 @@ void flow_patch(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : S
         c[4] = coarse_at(centre + float2(8.0, 8.0));
         c[5] = float2(0.0, 0.0);
         c[6] = (fl.x & F_TEMPORAL) ? Prev.SampleLevel(Lin, centre / float2(sz.xy), 0) : base;
-        c[7] = base;
+        // The opposite direction's motion where this patch lands, reversed: where one direction
+        // got lost (foliage beside something moving its own way), the other often didn't.
+        // fl.w: 1 the other direction at this level, 2 at the coarser level, 0 none yet.
+        float2 land = (centre + base) / float2(sz.xy);
+        c[7] = fl.w == 1 ? -FlowOther.SampleLevel(Lin, land, 0)
+             : fl.w == 2 ? -FlowOther.SampleLevel(Lin, land, 0) * 2.0
+             : base;
+        }
         float4 d0 = float4(sy(pc + c[0]), sy(pc + c[1]), sy(pc + c[2]), sy(pc + c[3])) - tx;
         float4 d1 = float4(sy(pc + c[4]), sy(pc + c[5]), sy(pc + c[6]), sy(pc + c[7])) - tx;
         float4 m0 = group_sum(gi, d0, buf) / 64.0;
@@ -357,8 +381,11 @@ void flow_patch(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : S
         float costs[8] = { s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w };
         float best = 1e30;
         v0 = base;
+        // Straying from the coarser level costs a little (k < 6: its neighbourhood and zero),
+        // last pair's and the opposite direction's motion are free: they're independent
+        // evidence, and right exactly where the coarser level went wrong.
         [unroll] for (int k = 0; k < 8; k++) {
-            float2 dd = abs(c[k] - base);
+            float2 dd = (k >= 6 && !prop) ? 0.0 : abs(c[k] - base);
             float cost = costs[k] + LAMBDA * (dd.x + dd.y);
             if (cost < best) {
                 best = cost;
@@ -398,7 +425,8 @@ void flow_patch(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : S
     }
 }
 
-// Per pixel: the covering patches' vectors, each weighted by how well it explains this pixel.
+// Per pixel: the covering patches' vectors, each weighted by how well it explains this pixel
+// (1/d^2: a patch that clearly fits outweighs one that nearly does).
 [numthreads(8, 8, 1)]
 void flow_dense(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= (uint2)sz.xy)) return;
@@ -411,7 +439,7 @@ void flow_dense(uint3 id : SV_DispatchThreadID) {
         int2 pi = clamp(k - 1 + int2(j & 1, j >> 1), int2(0, 0), gr.xy - 1);
         float2 v = PatchIn.Load(int3(pi, 0)).xy;
         float d = abs(sy(float2(x) + 0.5 + v) - tx);
-        float w = 1.0 / max(1.0, d);
+        float w = 1.0 / max(1.0, d * d);
         acc += w * v;
         ws += w;
     }
@@ -655,6 +683,7 @@ void flow_final(uint3 id : SV_DispatchThreadID) {
 
 #define EMPTY 0xFFFFFFFF
 #define INDEX_BITS 23
+
 
 // Push every pixel of A (z = 0) forward by t, or of B (z = 1) back by 1 - t, onto the 2x2
 // pixels around where it lands. Lowest key wins a pixel: visible in both pictures first, then
