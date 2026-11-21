@@ -363,6 +363,43 @@ impl Vsync {
     }
 }
 
+/// Fits the frames still waiting from the last pair (ending with its real picture) in before
+/// `first`, when the next pair wants to start, so the delay doesn't build up. They move closer
+/// together, by whole refreshes, down to one refresh apart: motion speeds up for a moment. Only
+/// if they don't fit even then are generated frames dropped (spread out; never the next one
+/// due or the real picture). Returns when the next pair can start and how many were dropped.
+///
+/// Games that miss a frame deliver the next one early (held 3 card frames, then 1): test
+/// sessions showed the whole queue thrown away each time before (a visible jump, and real
+/// pictures skipped), 66 times in 100 s of play.
+fn catch_up(queue: &mut VecDeque<Entry>, first: Instant, every: Duration, refresh: Duration) -> (Instant, u32) {
+    let (Some(front), Some(back)) = (queue.front(), queue.back()) else {
+        return (first, 0);
+    };
+    if back.at + every <= first {
+        return (first, 0);
+    }
+    let front_at = front.at;
+    let r = refresh.as_secs_f64();
+    // Whole refreshes from the next frame due to `first`: each waiting frame needs one.
+    let room = (first.saturating_duration_since(front_at).as_secs_f64() / r + 1e-6).floor() as usize;
+    let mut dropped = 0;
+    while queue.len() > room.max(1) {
+        let generated: Vec<usize> = (1..queue.len()).filter(|&i| !matches!(queue[i].what, Showing::Slot(_))).collect();
+        let Some(&i) = generated.get(generated.len() / 2) else { break };
+        queue.remove(i);
+        dropped += 1;
+    }
+    let n = queue.len() as u32;
+    let planned = ((every.as_secs_f64() / r).round() as u32).max(1);
+    let gap = (room as u32 / n.max(1)).clamp(1, planned);
+    for (i, e) in queue.iter_mut().enumerate() {
+        e.at = front_at + refresh * (gap * i as u32);
+    }
+    let last = queue.back().expect("not empty").at;
+    (first.max(last + refresh * gap), dropped)
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Showing {
     Black,
@@ -1133,26 +1170,12 @@ impl Video<'_> {
             }
             None => (now, Duration::from_secs_f64(step)),
         };
-        let (mut skipped, mut backlog_cleared) = (0, false);
-        if let Some(back) = self.queue.back() {
-            let after = back.at + every;
-            if after > first + Duration::from_secs_f64(span) {
-                // More than a picture's worth behind: let the backlog go.
-                backlog_cleared = true;
-                self.queue.clear();
-            } else if after > first {
-                // Still busy with the last pair: carry on after it. A whole step or more behind
-                // (a slow pair pushed everything later), skip that many of this pair's first
-                // generated frames; less than that, shorten the gap to it by whole refreshes
-                // (down to one), so the delay doesn't stay. Without this a schedule a little
-                // late stays late (test sessions: 12 ms extra for seconds after starting).
-                let behind = ((after - first).as_secs_f64() / every.as_secs_f64()) as usize;
-                skipped = behind.min(made.len()) as u32;
-                made.drain(..behind.min(made.len()));
-                let refresh = timing.map_or(every, |(_, p)| p);
-                first = first.max(back.at + refresh);
-            }
-        }
+        // Still busy with the last pair (the game's last picture came late and this one
+        // early, or a slow pair pushed things later): fit what's waiting in before this pair.
+        let refresh = timing.map_or(every, |(_, p)| p);
+        let (start, dropped) = catch_up(&mut self.queue, first, every, refresh);
+        first = start;
+        let (skipped, backlog_cleared) = (dropped, false);
         if telemetry::on() {
             telemetry::emit(Ev::Pair(telemetry::PairPlan {
                 seq: raw.seq,
@@ -1218,6 +1241,55 @@ mod tests {
         let r = fit((1001, 700), 16.0 / 9.0);
         assert_eq!(r[2], 1001.0);
         assert_eq!(r[3], 563.0);
+    }
+
+    fn waiting(start: Instant, spacing: Duration, kinds: &[bool]) -> VecDeque<Entry> {
+        kinds
+            .iter()
+            .enumerate()
+            .map(|(i, &real)| Entry {
+                at: start + spacing * i as u32,
+                what: if real { Showing::Slot(0) } else { Showing::Generated(i) },
+                arrived: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn on_schedule_nothing_moves() {
+        let t = Instant::now();
+        let (r, every) = (Duration::from_micros(4167), Duration::from_micros(8333));
+        let mut q = waiting(t, every, &[false, false, true]);
+        let before: Vec<Instant> = q.iter().map(|e| e.at).collect();
+        let (first, dropped) = catch_up(&mut q, t + every * 3, every, r);
+        assert_eq!((first, dropped), (t + every * 3, 0));
+        assert_eq!(q.iter().map(|e| e.at).collect::<Vec<_>>(), before);
+    }
+
+    #[test]
+    fn an_early_picture_squeezes_the_wait_instead_of_dropping_it() {
+        // 120 on 240 Hz: three frames (the last one real) 2 refreshes apart, but the next pair
+        // wants to start 4 refreshes after the first of them.
+        let t = Instant::now();
+        let (r, every) = (Duration::from_micros(4167), Duration::from_micros(8334));
+        let mut q = waiting(t, every, &[false, false, true]);
+        let (first, dropped) = catch_up(&mut q, t + r * 4, every, r);
+        assert_eq!(dropped, 0, "all three still shown");
+        assert_eq!(q.iter().map(|e| e.at).collect::<Vec<_>>(), [t, t + r, t + r * 2]);
+        assert_eq!(first, t + r * 4, "the next pair still starts when it wanted to");
+    }
+
+    #[test]
+    fn with_no_room_generated_frames_go_but_never_the_real_picture() {
+        // 240 on 240 Hz: six waiting, a refresh apart, room for three.
+        let t = Instant::now();
+        let r = Duration::from_micros(4167);
+        let mut q = waiting(t, r, &[false, false, false, false, false, true]);
+        let (first, dropped) = catch_up(&mut q, t + r * 3, r, r);
+        assert_eq!(dropped, 3);
+        assert!(matches!(q.back().unwrap().what, Showing::Slot(_)), "the real picture stays");
+        assert!(matches!(q.front().unwrap().what, Showing::Generated(0)), "the next one due stays");
+        assert_eq!(first, t + r * 3);
     }
 
     #[test]

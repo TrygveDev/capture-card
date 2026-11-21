@@ -167,6 +167,8 @@ pub struct VideoOptions {
     pub test: Option<(u32, u32)>,
     /// The test pattern's width and height (2560x1440 if not given).
     pub test_size: Option<(u32, u32)>,
+    /// The test pattern's pictures come unevenly now and then, like a game missing a frame.
+    pub test_hitch: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -220,7 +222,7 @@ pub fn spawn(shared: Arc<VideoShared>, opts: VideoOptions) {
             crate::raise_thread_priority("Capture");
             let presenter = Presenter::spawn(shared.clone());
             if let Some((fps, content)) = opts.test {
-                test_pattern(&shared, &presenter, fps, content, opts.test_size);
+                test_pattern(&shared, &presenter, (fps, content, opts.test_hitch), opts.test_size);
                 return;
             }
             // Debug: a short limit makes reads give up during start-up, to test reopening.
@@ -961,7 +963,21 @@ fn show(shared: &VideoShared, image: Arc<RenderImage>) {
 /// A synthetic NV12 source (2560x1440 unless `size` says) at `fps`: a bar sweeping across a gradient, moving
 /// `content` times a second, paced on absolute deadlines. Goes through the same converter
 /// and hand-off as real frames.
-fn test_pattern(shared: &VideoShared, presenter: &Presenter, fps: u32, content: u32, size: Option<(u32, u32)>) {
+/// The test pattern's picture at card frame `n`: evenly paced, or with `hitch` every fifth
+/// picture held a card frame longer and the next one a frame shorter, as a game that misses a
+/// frame delivers them (at 30 fps on 60 Hz: held 2, 2, 2, 3, 1).
+fn test_picture(n: u64, fps: u32, content: u32, hitch: bool) -> usize {
+    let h = (fps / content.max(1)) as u64;
+    if !hitch || h < 2 {
+        return (n * content as u64 / fps as u64) as usize;
+    }
+    let (cycle, r) = (n / (5 * h), n % (5 * h));
+    let starts = [0, h, 2 * h, 3 * h, 4 * h + 1];
+    cycle as usize * 5 + starts.iter().rposition(|&s| r >= s).unwrap_or(0)
+}
+
+fn test_pattern(shared: &VideoShared, presenter: &Presenter, rates: (u32, u32, bool), size: Option<(u32, u32)>) {
+    let (fps, content, hitch) = rates;
     #[allow(non_snake_case)] // constants until the size became an option
     let (W, H) = size.map_or((2560, 1440), |(w, h)| (w as usize & !1, h as usize & !1));
     *shared.status.lock().unwrap() = format!("Test pattern {W}x{H} @ {fps}");
@@ -1009,7 +1025,7 @@ fn test_pattern(shared: &VideoShared, presenter: &Presenter, fps: u32, content: 
         buf.copy_from_slice(&base);
         // A white bar moving one bar-width per picture, so dropped frames show as jumps.
         let bar = 64;
-        let picture = (n * content as u64 / fps as u64) as usize;
+        let picture = test_picture(n, fps, content, hitch);
         let x0 = (picture * bar) % W;
         for y in 0..H {
             buf[y * W + x0..y * W + (x0 + bar).min(W)].fill(235);
@@ -1379,5 +1395,24 @@ mod range_tests {
             assert_eq!(g.feed(RangeVote::Limited), Some(true));
         }
         assert_eq!(g.feed(RangeVote::Limited), Some(false));
+    }
+}
+
+#[cfg(test)]
+mod test_pattern_tests {
+    use super::test_picture;
+
+    #[test]
+    fn hitches_hold_one_picture_longer_and_the_next_shorter() {
+        let holds = |hitch| {
+            let p: Vec<usize> = (0..20).map(|n| test_picture(n, 60, 30, hitch)).collect();
+            let mut runs = vec![1];
+            for w in p.windows(2) {
+                if w[0] == w[1] { *runs.last_mut().unwrap() += 1 } else { runs.push(1) }
+            }
+            runs
+        };
+        assert_eq!(holds(false), [2; 10]);
+        assert_eq!(holds(true), [2, 2, 2, 3, 1, 2, 2, 2, 3, 1]);
     }
 }

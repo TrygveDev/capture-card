@@ -1108,7 +1108,7 @@ fn parse_args() -> Args {
     let mut a = Args {
         list: false,
         snapshot: None,
-        video: VideoOptions { device: None, mode: None, test: None, test_size: None },
+        video: VideoOptions { device: None, mode: None, test: None, test_size: None, test_hitch: false },
         audio: None,
         stats: cfg!(debug_assertions),
         exit_after: None,
@@ -1153,6 +1153,8 @@ fn parse_args() -> Args {
                     Some((fps, content.parse::<u32>().ok()?.clamp(1, fps)))
                 })
             }
+            // The test pattern's pictures come unevenly now and then (held 2, 2, 2, 3, 1 at 30 on 60).
+            "--test-hitch" => a.video.test_hitch = true,
             // WIDTHxHEIGHT of the test pattern (2560x1440 if not given).
             "--test-size" => {
                 a.video.test_size = args.next().and_then(|s| {
