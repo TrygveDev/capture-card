@@ -60,7 +60,9 @@ Texture2D<uint>   KeyA      : register(t14);
 Texture2D<uint>   KeyB      : register(t15);
 Texture2D<float4> FA        : register(t16);
 Texture2D<float4> FB        : register(t17);
-Texture2D<uint>   CountsIn  : register(t18); // (0,0): patches missed, (1,0): textured patches
+Texture2D<uint>   CountsIn  : register(t18); // per pair, A->B: 0 patches missed, 1 textured patches,
+                                             // 2, 3 their cost and detail (the cut test), 4 level-0
+                                             // pixels that changed, 5 of those motion can't follow
 Texture2D<float4> Shown     : register(t19);
 Texture2D<float4> InfoIn    : register(t20);
 Texture2D<float4> FX        : register(t21); // the picture motion is measured from, in colour
@@ -447,6 +449,14 @@ void flow_snap(uint3 id : SV_DispatchThreadID) {
 #define HIDDEN_STEP 5
 #define HIDDEN_START 0.7
 #define HIDDEN_RAMP 0.2
+// Levels of difference between A and B (unmoved) for a level-0 pixel to count as changed.
+#define CHANGED 4.0
+// The UI-change test: when more than LOST_START of what changed can't be followed (ramping to
+// all of the frame over LOST_RAMP), the change isn't motion but a menu, a highlight jumping,
+// a screen opening. Following parts of it tears it (pieces move, the rest blends), so the whole
+// frame cross-fades. Gameplay stays under 0.35 on the test clips, menu changes are 0.65 and up.
+#define LOST_START 0.45
+#define LOST_RAMP 0.15
 
 // x: mismatch with the opposite flow (relative, see above); y: |Y moved - X|; z: |Y unmoved - X|.
 [numthreads(8, 8, 1)]
@@ -567,6 +577,11 @@ void flow_final(uint3 id : SV_DispatchThreadID) {
         hidden += InfoIn.Load(int3(n, 0)).x > OCCLUDED ? 1.0 : 0.0;
     }
     u = max(u, saturate((hidden / 49.0 - HIDDEN_START) / HIDDEN_RAMP));
+    if ((fl.x & F_COUNT) && info.z > CHANGED) {
+        uint old;
+        InterlockedAdd(Counts[int2(4, 0)], 1, old);
+        if (u > 0.5 || info.x > OCCLUDED) InterlockedAdd(Counts[int2(5, 0)], 1, old);
+    }
     Out4[x] = float4(v, info.x, u);
 }
 
@@ -644,6 +659,13 @@ void compose(uint3 id : SV_DispatchThreadID) {
     float t = misc.x;
     float2 size = float2(sz.xy);
     float2 c = float2(p) + 0.5;
+    uint changed = CountsIn.Load(int3(4, 0, 0));
+    uint lost = CountsIn.Load(int3(5, 0, 0));
+    float ui = changed > 0 ? saturate(((float)lost / (float)changed - LOST_START) / LOST_RAMP) : 0.0;
+    if (ui >= 1.0) {
+        OutInterp[p] = float4(lerp(FA.Load(int3(p, 0)).rgb, FB.Load(int3(p, 0)).rgb, t), 1.0);
+        return;
+    }
     float2 va, vb;
     float ua, ub;
     float visa = side(p, true, va, ua);
@@ -690,7 +712,7 @@ void compose(uint3 id : SV_DispatchThreadID) {
     busy *= 255.0 / 24.0;
     float keep = (visa > 0.5 && visb > 0.5) ? saturate((dm - d0 - 1.0) / (0.5 * d0 + 3.0)) : saturate(1.0 - d0 / 2.0);
     keep *= saturate(busy / 8.0 - 0.25);
-    u = max(u, keep);
+    u = max(u, max(keep, ui));
     float3 still = lerp(FA.Load(int3(p, 0)).rgb, FB.Load(int3(p, 0)).rgb, t);
     OutInterp[p] = float4(lerp(moved, still, u), 1.0);
 }

@@ -557,6 +557,9 @@ struct Gen {
     counts: Tex,
 }
 
+/// Counters of a pair's motion (see gpu.hlsl's `CountsIn`).
+const COUNTS: usize = 6;
+
 /// Most generated frames kept at once (each one frame in size): two pairs' worth at 30 -> 240.
 pub const OUTS: usize = 14;
 
@@ -662,7 +665,7 @@ impl Gen {
             info: [level0()?, level0()?],
             fin: [level0()?, level0()?],
             keys: [gpu.tex(w, h, DXGI_FORMAT_R32_UINT, true)?, gpu.tex(w, h, DXGI_FORMAT_R32_UINT, true)?],
-            counts: gpu.tex(4, 1, DXGI_FORMAT_R32_UINT, true)?,
+            counts: gpu.tex(COUNTS as u32, 1, DXGI_FORMAT_R32_UINT, true)?,
         })
     }
 }
@@ -818,7 +821,10 @@ impl Frames {
             let (sx, _) = pair(dir);
             let srvs = [(10, &fg.snapped[dir]), (20, &fg.info[dir]), (21, &sx.frame)];
             gpu.run(&gpu.k.flow_fill, &pf, &srvs, &[(3, &fg.rough[0])], g);
-            gpu.run(&gpu.k.flow_final, &p, &[(10, &fg.rough[0]), (20, &fg.info[dir])], &[(2, &fg.fin[dir])], g);
+            // A->B counts how much of what changed it can follow (the UI-change test).
+            let pd = Params { fl: [if dir == 0 { F_COUNT } else { 0 }, 0, 0, 0], ..p };
+            let uavs = [(2, &fg.fin[dir]), (4, &fg.counts)];
+            gpu.run(&gpu.k.flow_final, &pd, &[(10, &fg.rough[0]), (20, &fg.info[dir])], &uavs, g);
         }
         fg.temporal = true;
     }
@@ -868,10 +874,10 @@ impl Frames {
         Ok((px, t.w as usize, t.h as usize))
     }
 
-    /// Cut-test counts (patches missed, textured patches), read back synchronously (tests only).
-    pub fn counts(&self, gpu: &Gpu) -> Result<[u32; 4]> {
+    /// The pair's counters (see gpu.hlsl's `CountsIn`), read back synchronously (tests only).
+    pub fn counts(&self, gpu: &Gpu) -> Result<[u32; COUNTS]> {
         let b = gpu.read(&self.fg().counts, 4)?;
-        Ok([0, 1, 2, 3].map(|i| u32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])))
+        Ok(std::array::from_fn(|i| u32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])))
     }
 }
 

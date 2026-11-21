@@ -265,7 +265,7 @@ pub fn interp_test(src: &Path, out_dir: &Path, other: Option<&Path>) -> Result<(
     f.estimate(&gpu, 0, 1);
     f.interpolate(&gpu, 0, 1, 0.5, 0);
     let out = rgb_of(&gpu.read(&f.outs[0], 4)?);
-    let [_, _, cost, detail] = f.counts(&gpu)?;
+    let [_, _, cost, detail, ..] = f.counts(&gpu)?;
 
     // Timings: decode + pyramid of one frame (already uploaded), and motion + one generated frame.
     let iters = 50;
@@ -357,7 +357,7 @@ pub fn interp_test(src: &Path, out_dir: &Path, other: Option<&Path>) -> Result<(
         f.decode(&gpu, 1, &RGB, true);
         f.forget_motion();
         f.estimate(&gpu, 0, 1);
-        let [_, _, cost, detail] = f.counts(&gpu)?;
+        let [_, _, cost, detail, ..] = f.counts(&gpu)?;
         let share = cost as f64 / detail.max(1) as f64;
         println!(
             "unrelated picture: cost {share:.3} of detail -> {}",
@@ -517,9 +517,12 @@ pub fn eval(clip: &Path, out_dir: &Path, skip: usize, keep: &[usize]) -> Result<
         gpu.wait_idle()?;
         gen_ms += t.elapsed().as_secs_f64() * 1000.0 / (skip - 1) as f64;
         let (a, b) = (read(&f, sa)?, read(&f, sb)?);
-        let [_, _, cost, detail] = f.counts(&gpu)?;
-        let mut line =
-            format!("pair {pair:2} ({ia}->{ib}) cost/detail {:.2}:", cost as f64 / detail.max(1) as f64);
+        let [_, _, cost, detail, changed, lost] = f.counts(&gpu)?;
+        let mut line = format!(
+            "pair {pair:2} ({ia}->{ib}) cost/detail {:.2} lost/changed {:.2} ({changed}):",
+            cost as f64 / detail.max(1) as f64,
+            lost as f64 / changed.max(1) as f64
+        );
         for j in 1..skip {
             let ts = j as f32 / skip as f32;
             let out = rgb_of(&gpu.read(&f.outs[j - 1], 4)?);
