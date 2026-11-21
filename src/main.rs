@@ -352,15 +352,11 @@ impl Viewer {
         cx.notify();
     }
 
-    /// Cycles frame generation: off, then up to 60, 120 or 240 fps (never past the display's
-    /// own refresh rate).
+    /// Cycles frame generation: off, then up to 60, 120 or 240 fps, skipping rates past the
+    /// display's own refresh (it can't show them; 144 Hz still gets 120).
     fn cycle_smooth(&mut self, cx: &mut Context<Self>) {
-        self.settings.smooth = match self.settings.smooth {
-            0 => 60,
-            60 => 120,
-            120 => 240,
-            _ => 0,
-        };
+        let hz = self.video.gpu.refresh_hz.load(Ordering::Relaxed);
+        self.settings.smooth = next_smooth(self.settings.smooth, hz);
         self.video.gpu.target.store(self.settings.smooth, Ordering::Relaxed);
         self.settings.save();
         cx.notify();
@@ -917,6 +913,38 @@ impl Render for Viewer {
             .child(video)
             .children(overlay)
             .when(self.controls_visible, |d| d.child(controls))
+    }
+}
+
+/// The frame generation target after `now` (0 = off), offering only rates up to `hz` (0 =
+/// display rate not known: all of them).
+fn next_smooth(now: u32, hz: u32) -> u32 {
+    let fits = |f: u32| hz == 0 || f <= hz + hz / 20;
+    [60, 120, 240].into_iter().filter(|&f| f > now && fits(f)).min().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod smooth_tests {
+    use super::next_smooth;
+
+    #[test]
+    fn cycles_only_through_rates_the_display_shows() {
+        let cycle = |hz| {
+            let mut seen = vec![];
+            let mut s = 0;
+            loop {
+                s = next_smooth(s, hz);
+                if s == 0 {
+                    return seen;
+                }
+                seen.push(s);
+            }
+        };
+        assert_eq!(cycle(240), [60, 120, 240]);
+        assert_eq!(cycle(144), [60, 120]);
+        assert_eq!(cycle(60), [60]);
+        assert_eq!(cycle(59), [60]);
+        assert_eq!(cycle(0), [60, 120, 240]);
     }
 }
 

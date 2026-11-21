@@ -568,7 +568,7 @@ pub fn eval(clip: &Path, out_dir: &Path, skip: usize, keep: &[usize]) -> Result<
 }
 
 /// Pictures of a direction's fields: `-flow` (hue = direction, brightness = speed, full at 32
-/// half-size pixels), `-occ` (white = hidden in the other picture, grey = partly) and `-unrel` (white =
+/// level-0 pixels), `-occ` (white = hidden in the other picture, grey = partly) and `-unrel` (white =
 /// falls back to a blend).
 fn save_fields(fields: &(Vec<[f32; 4]>, usize, usize), base: &Path) -> Result<()> {
     let (px, w, h) = fields;

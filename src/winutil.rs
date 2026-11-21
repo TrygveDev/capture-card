@@ -66,7 +66,7 @@ pub fn set_cursor_hidden(hidden: bool) {
 pub fn install(hwnd: HWND, events: UnboundedSender<Event>) {
     let _ = EVENTS.set(events);
     unsafe {
-        let prev = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, wndproc as usize as isize);
+        let prev = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, wndproc as *const () as usize as isize);
         PREV_PROC.store(prev, Ordering::Relaxed);
     }
 }

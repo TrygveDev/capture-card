@@ -857,7 +857,7 @@ fn run(
         let hdr = shared.hdr.load(Ordering::Relaxed);
         if shared.gpu.ready.load(Ordering::Acquire) {
             let decode = if hdr { o.fmt.gpu_hdr } else { o.fmt.gpu_sdr };
-            let data = raw_frame(&sample, &o.fmt)?;
+            let data = raw_frame(&sample, &o.fmt, presenter.buffer())?;
             let (w, h) = (o.fmt.width as u32, o.fmt.height as u32);
             counted(shared, t0.elapsed());
             presenter.push(RawFrame { data, w, h, decode, at: t0 });
@@ -879,7 +879,8 @@ fn counted(shared: &VideoShared, spent: Duration) {
 
 /// Copies a sample's pixels out packed for the GPU: NV12 as Y rows then UV rows, YUY2 rows,
 /// or BGRA rows top-down.
-fn raw_frame(sample: &IMFSample, fmt: &Format) -> Result<Vec<u8>> {
+/// `out` is an empty buffer to fill (one used before has room already).
+fn raw_frame(sample: &IMFSample, fmt: &Format, mut out: Vec<u8>) -> Result<Vec<u8>> {
     let buffer = unsafe {
         if sample.GetBufferCount()? == 1 {
             sample.GetBufferByIndex(0)?
@@ -890,7 +891,6 @@ fn raw_frame(sample: &IMFSample, fmt: &Format) -> Result<Vec<u8>> {
     let locked = Locked::new(buffer)?;
     let (w, h) = (fmt.width, fmt.height);
     let bytes = locked.bytes();
-    let mut out = Vec::new();
     match fmt.layout {
         Layout::Nv12 => {
             let pitch = if locked.pitch > 0 { locked.pitch as usize } else { w };
@@ -1017,7 +1017,9 @@ fn test_pattern(shared: &VideoShared, presenter: &Presenter, fps: u32, content: 
                 white_nits: HDR_WHITE_NITS as f32,
             };
             counted(shared, t0.elapsed());
-            presenter.push(RawFrame { data: buf.clone(), w: W as u32, h: H as u32, decode, at: t0 });
+            let mut data = presenter.buffer();
+            data.extend_from_slice(&buf);
+            presenter.push(RawFrame { data, w: W as u32, h: H as u32, decode, at: t0 });
             continue;
         }
         let mut out = vec![0u8; W * H * 4];

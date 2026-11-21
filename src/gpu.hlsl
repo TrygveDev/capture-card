@@ -3,7 +3,8 @@
 //
 // Frame generation, per pair of pictures A and B:
 //  1. Dense optical flow both ways (A->B and B->A), coarse to fine over a luma pyramid that
-//     starts at half size. Each level searches 8x8 patches every 4 pixels (candidates from the
+//     starts at half size (quarter size for 4K: motion needs no more detail, and it's the
+//     costliest part). Each level searches 8x8 patches every 4 pixels (candidates from the
 //     coarser level, the last pair and zero, then Lucas-Kanade refinement), turns the patches
 //     into a per-pixel field weighted by how well each explains the pixel, and takes a 3x3
 //     median against outliers.
@@ -23,7 +24,8 @@ cbuffer Params : register(b0) {
     int4 sz;     // xy: size of the level or frame worked on; zw: second size
     int4 gr;     // xy: patch grid size; zw: size of the next coarser level
     float4 kc;   // YCbCr -> RGB: Cr->R, Cb->G, Cr->G, Cb->B
-    float4 misc; // x: t (generation) ; y: SDR white in nits ; z: luma offset ; w: luma range
+    float4 misc; // x: t (generation) ; y: SDR white in nits (decode), else full-size pixels per
+                 // level-0 pixel ; z: luma offset ; w: luma range
     uint4 fl;    // x: flags ; y: input layout ; z: chroma range
     float4 rect; // present: video rect x, y, w, h in back-buffer pixels
 };
@@ -144,7 +146,7 @@ void decode(uint3 id : SV_DispatchThreadID) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Luma pyramid (0..255 floats): level 0 is half size, each next level half again.
+// Luma pyramid (0..255 floats): level 0 is 1/misc.y size (2 or 4), each next level half again.
 
 float luma(float4 c) {
     return dot(saturate(c.rgb), float3(77.0, 150.0, 29.0) / 256.0) * 255.0;
@@ -153,10 +155,13 @@ float luma(float4 c) {
 [numthreads(8, 8, 1)]
 void luma0(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= (uint2)sz.xy)) return;
-    int2 p = int2(id.xy) * 2;
+    int s = (int)misc.y;
+    int2 p = int2(id.xy) * s;
     int2 m = sz.zw - 1;
-    OutLuma[id.xy] = 0.25 * (luma(InFrame.Load(int3(min(p, m), 0))) + luma(InFrame.Load(int3(min(p + int2(1, 0), m), 0)))
-                           + luma(InFrame.Load(int3(min(p + int2(0, 1), m), 0))) + luma(InFrame.Load(int3(min(p + 1, m), 0))));
+    float acc = 0.0;
+    [loop] for (int j = 0; j < s; j++)
+        [loop] for (int i = 0; i < s; i++) acc += luma(InFrame.Load(int3(min(p + int2(i, j), m), 0)));
+    OutLuma[id.xy] = acc / (float)(s * s);
 }
 
 [numthreads(8, 8, 1)]
@@ -417,7 +422,7 @@ void flow_snap(uint3 id : SV_DispatchThreadID) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Checks at level 0 (half size), per direction X -> Y.
+// Checks at level 0, per direction X -> Y.
 
 // A pixel counts as hidden in the other picture when the opposite direction doesn't bring it
 // back to within OCC_ABS level-0 pixels plus OCC_REL of its motion (fast motion is measured
@@ -458,15 +463,17 @@ static const float2 DIRS[8] = {
     float2(1, 1), float2(-1, 1), float2(1, -1), float2(-1, -1),
 };
 
-// What the 4x4 full-size pixels around level-0 pixel p look like: mean colour, and how busy
-// they are (mean absolute deviation of their luma), all in levels.
+// What the full-size pixels around level-0 pixel p look like (4x4 samples, spaced to cover two
+// level-0 pixels each way): mean colour, and how busy they are (mean absolute deviation of
+// their luma), all in levels.
 float4 look(int2 p) {
-    int2 o = p * 2 - 1;
+    int step = (int)misc.y / 2;
+    int2 o = p * (int)misc.y - step;
     int2 m = sz.zw - 1;
     float3 c[16];
     float3 s = 0.0;
     [unroll] for (int k = 0; k < 16; k++) {
-        c[k] = FX.Load(int3(clamp(o + int2(k & 3, k >> 2), int2(0, 0), m), 0)).rgb;
+        c[k] = FX.Load(int3(clamp(o + int2(k & 3, k >> 2) * step, int2(0, 0), m), 0)).rgb;
         s += c[k];
     }
     s /= 16.0;
@@ -560,7 +567,7 @@ void project(uint3 id : SV_DispatchThreadID) {
     float2 size = float2(sz.xy);
     float2 xc = float2(id.xy) + 0.5;
     float4 f = id.z == 0 ? FinA.SampleLevel(Lin, xc / size, 0) : FinB.SampleLevel(Lin, xc / size, 0);
-    float2 v = f.xy * 2.0;
+    float2 v = f.xy * misc.y;
     float2 yc = xc + (id.z == 0 ? t : 1.0 - t) * v;
     int2 base = (int2)floor(yc - 0.5);
     uint vis = f.z < 0.0 ? 3 : (f.z < 0.5 ? 0 : (f.z < 1.0 ? 1 : (f.z < 2.0 ? 2 : 3)));
@@ -596,7 +603,7 @@ float side(int2 p, bool fromA, out float2 v, out float u) {
     uint idx = best & ((1u << INDEX_BITS) - 1);
     float2 xc = float2(idx % (uint)sz.x, idx / (uint)sz.x) + 0.5;
     float4 f = fromA ? FinA.SampleLevel(Lin, xc / float2(sz.xy), 0) : FinB.SampleLevel(Lin, xc / float2(sz.xy), 0);
-    v = fromA ? f.xy * 2.0 : -f.xy * 2.0;
+    v = fromA ? f.xy * misc.y : -f.xy * misc.y;
     u = f.w;
     return hits / 9.0;
 }

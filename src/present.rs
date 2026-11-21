@@ -67,6 +67,8 @@ pub struct Shared {
     pub rtx: AtomicBool,
     /// How the last frame was scaled (a `Scaling`).
     pub scaling: AtomicU8,
+    /// The display's refresh rate in whole Hz (0 = not known yet).
+    pub refresh_hz: AtomicU32,
 }
 
 /// How the video is being scaled to the window.
@@ -92,6 +94,7 @@ impl Shared {
             summary: Mutex::new(String::new()),
             rtx: AtomicBool::new(rtx),
             scaling: AtomicU8::new(Scaling::NotUp as u8),
+            refresh_hz: AtomicU32::new(0),
         }
     }
 
@@ -110,26 +113,58 @@ impl Shared {
 
 pub struct Presenter {
     tx: Sender<RawFrame>,
+    spare: Spare,
+}
+
+/// Frame buffers the presenter is done with, for the capture side to fill again. A 4K frame
+/// is 12 MB: a fresh allocation that size comes straight from the OS, zeroed page by page,
+/// which costs about a millisecond every frame before the copy even starts.
+#[derive(Clone, Default)]
+pub struct Spare(Arc<Mutex<Vec<Vec<u8>>>>);
+
+impl Spare {
+    /// Enough for the frame in flight, the one kept for comparison and one to swap.
+    const KEEP: usize = 3;
+
+    pub fn take(&self) -> Vec<u8> {
+        self.0.lock().unwrap().pop().unwrap_or_default()
+    }
+
+    pub fn give(&self, buf: Vec<u8>) {
+        let mut spare = self.0.lock().unwrap();
+        if spare.len() < Self::KEEP {
+            spare.push(buf);
+        }
+    }
 }
 
 impl Presenter {
     pub fn spawn(shared: Arc<VideoShared>) -> Presenter {
         let (tx, rx) = mpsc::channel();
+        let spare = Spare::default();
+        let theirs = spare.clone();
         std::thread::Builder::new()
             .name("present".into())
             .spawn(move || {
                 crate::raise_thread_priority("Playback");
-                if let Err(e) = run(&shared, rx) {
+                if let Err(e) = run(&shared, rx, theirs) {
                     crate::log::line(&format!("gpu: {e:#}; falling back to the CPU path"));
                 }
                 shared.gpu.ready.store(false, Ordering::Release);
             })
             .expect("spawn present thread");
-        Presenter { tx }
+        Presenter { tx, spare }
     }
 
     pub fn push(&self, frame: RawFrame) {
         let _ = self.tx.send(frame);
+    }
+
+    /// An empty buffer to copy the next frame into (with room for one, after the first few).
+    pub fn buffer(&self) -> Vec<u8> {
+        let mut b = self.spare.take();
+        b.clear();
+        b
     }
 }
 
@@ -314,6 +349,7 @@ struct Video<'a> {
     next_out: usize,
     queue: VecDeque<Entry>,
     last_raw: Option<Vec<u8>>,
+    spare: Spare,
     last_decode: Option<Decoding>,
     last_at: Option<Instant>,
     since_new: u32,
@@ -365,7 +401,7 @@ fn fit(client: (u32, u32), aspect: f32) -> [f32; 4] {
     [((vw - w) / 2.0).floor(), ((vh - h) / 2.0).floor(), w, h]
 }
 
-fn run(shared: &VideoShared, rx: Receiver<RawFrame>) -> Result<()> {
+fn run(shared: &VideoShared, rx: Receiver<RawFrame>, spare: Spare) -> Result<()> {
     // Wait for the window.
     let hwnd = loop {
         if let Some(&h) = shared.gpu.hwnd.get() {
@@ -392,6 +428,7 @@ fn run(shared: &VideoShared, rx: Receiver<RawFrame>) -> Result<()> {
         next_out: 0,
         queue: VecDeque::new(),
         last_raw: None,
+        spare,
         last_decode: None,
         last_at: None,
         since_new: 0,
@@ -409,7 +446,10 @@ fn run(shared: &VideoShared, rx: Receiver<RawFrame>) -> Result<()> {
     };
     v.draw(None)?;
     shared.gpu.ready.store(true, Ordering::Release);
-    match vblank() {
+    let timing = vblank();
+    v.refresh = timing.map(|(at, p)| (at, p, Instant::now()));
+    v.note_refresh();
+    match timing {
         Some((_, p)) => crate::log::line(&format!("gpu: drawing video on the GPU, display at {:.1} Hz", 1.0 / p.as_secs_f64())),
         None => crate::log::line("gpu: drawing video on the GPU, display timing unknown"),
     }
@@ -515,6 +555,7 @@ impl Video<'_> {
         if self.refresh.is_none_or(|(_, _, read)| now.saturating_duration_since(read) > Duration::from_millis(500)) {
             self.refresh = vblank().map(|(v, p)| (v, p, now));
         }
+        self.note_refresh();
         let Some((v, p, _)) = self.refresh else {
             return now;
         };
@@ -547,6 +588,14 @@ impl Video<'_> {
         Ok(())
     }
 
+    /// Publishes the display's refresh rate for the UI (the window may move to another display).
+    fn note_refresh(&self) {
+        if let Some((_, p, _)) = self.refresh {
+            let hz = (1.0 / p.as_secs_f64()).round() as u32;
+            self.shared.gpu.refresh_hz.store(hz, Ordering::Relaxed);
+        }
+    }
+
     fn tick_stats(&mut self) {
         let smoothing = self.shared.gpu.target.load(Ordering::Relaxed) > 0;
         if self.total.is_none() && self.started.elapsed() >= Duration::from_secs(2) {
@@ -559,6 +608,10 @@ impl Video<'_> {
         }
         self.shared.meter.set_gpu(smoothing.then_some(self.gpu_time));
         if self.window.since.elapsed() >= Duration::from_secs(5) {
+            if let Some((at, p)) = vblank() {
+                self.refresh = Some((at, p, Instant::now()));
+                self.note_refresh();
+            }
             if self.shared.gpu.stats.load(Ordering::Relaxed) {
                 eprintln!(
                     "{}, GPU {:.1} ms a pair",
@@ -614,6 +667,13 @@ impl Video<'_> {
         self.pending = None;
     }
 
+    /// Keeps `data` as the last frame, for spotting repeats; the one it replaces is reused.
+    fn keep_raw(&mut self, data: Option<Vec<u8>>) {
+        if let Some(old) = std::mem::replace(&mut self.last_raw, data) {
+            self.spare.give(old);
+        }
+    }
+
     fn take_slot(&mut self) -> usize {
         let s = self.next_slot;
         self.next_slot = 1 - s;
@@ -627,14 +687,20 @@ impl Video<'_> {
             None => true,
         };
         self.last_at = Some(raw.at);
-        let new_format = self.frames.as_ref().is_none_or(|f| (f.w, f.h, f.layout) != (raw.w, raw.h, raw.decode.layout));
+        // Frame generation's textures exist only while it's on (several hundred megabytes at
+        // 4K), so turning it on or off remakes them like a new format.
+        let smoothing = target > 0;
+        let new_format = self.frames.as_ref().is_none_or(|f| {
+            (f.w, f.h, f.layout, f.has_gen()) != (raw.w, raw.h, raw.decode.layout, smoothing)
+        });
         if new_format {
             self.queue.clear();
             self.pair = None;
             self.key = None;
             self.showing = Showing::Black;
+            self.next_out = 0;
             self.frames = None;
-            self.frames = Some(Frames::new(&self.gpu, raw.w, raw.h, raw.decode.layout)?);
+            self.frames = Some(Frames::with(&self.gpu, raw.w, raw.h, raw.decode.layout, smoothing)?);
         }
         let new_decode = self.last_decode != Some(raw.decode);
         self.last_decode = Some(raw.decode);
@@ -654,10 +720,11 @@ impl Video<'_> {
             // presenting, so it adds no delay.
             let checked = if self.shared.meter.is_on() {
                 let new = self.last_raw.as_ref().is_none_or(|prev| !same_picture(prev, &raw.data));
-                self.last_raw = Some(raw.data);
+                self.keep_raw(Some(raw.data));
                 Some(new)
             } else {
-                self.last_raw = None;
+                self.keep_raw(None);
+                self.spare.give(raw.data);
                 None
             };
             self.count_frame(raw.at, checked);
@@ -676,7 +743,7 @@ impl Video<'_> {
                     let seen = self.on_screen(Instant::now());
                     self.shared.meter.shown(seen, false, None);
                 }
-                self.last_raw = Some(raw.data);
+                self.keep_raw(Some(raw.data));
                 return Ok(());
             }
         }
@@ -691,7 +758,7 @@ impl Video<'_> {
             f.upload(&self.gpu, &raw.data)?;
             f.decode(&self.gpu, slot, &raw.decode, true);
         }
-        self.last_raw = Some(raw.data);
+        self.keep_raw(Some(raw.data));
         let prev_key = self.key.replace(slot);
         let held = if restart {
             self.since_new = 0;
@@ -717,6 +784,7 @@ impl Video<'_> {
         let timing = vblank();
         if let Some((v, p)) = timing {
             self.refresh = Some((v, p, Instant::now()));
+            self.note_refresh();
         }
         let refresh = timing.map_or(1.0 / 240.0, |(_, p)| p.as_secs_f64());
         // A little slack: 33.33 ms over 4.1667 ms refreshes measures as 7.99, which is 8.
@@ -728,13 +796,17 @@ impl Video<'_> {
         }
         let submitted = Instant::now();
         let f = self.frames.as_mut().expect("made above");
+        // Two pairs' worth of generated frames (see `Frames::outs`), made the first time a
+        // pair needs this many: 6 at 30 -> 120, 14 at 30 -> 240.
+        f.ensure_outs(&self.gpu, 2 * (steps as usize - 1))?;
+        let ring = f.outs.len();
         f.estimate(&self.gpu, a, slot);
         self.pair = Some((a, slot));
         // The first frame now; the rest a step before each is due (see `Pending`).
         let mut made = Vec::with_capacity(steps as usize);
         for j in 1..steps {
             let out = self.next_out;
-            self.next_out = (self.next_out + 1) % crate::gpu::OUTS;
+            self.next_out = (self.next_out + 1) % ring;
             let t = j as f32 / steps as f32;
             if j == 1 {
                 f.interpolate(&self.gpu, a, slot, t, out);

@@ -513,23 +513,35 @@ impl Gpu {
     }
 }
 
-/// A decoded picture and its luma pyramid (level 0 is half size).
+/// A decoded picture and its luma pyramid (level 0 is 1/`Frames::scale0` size).
 pub struct Slot {
     pub frame: Tex,
     luma: Vec<Tex>,
 }
 
-/// Everything sized to one video format: upload textures, two picture slots, the flow both
-/// ways (last pair's kept as candidates), the landing maps and the generated frames.
+/// Everything sized to one video format: upload textures, two picture slots and, while frame
+/// generation is on, what it needs (`Gen`) and the generated frames. Without frame generation
+/// only the first three are made: at 4K the rest is several hundred megabytes.
 pub struct Frames {
     pub w: u32,
     pub h: u32,
     pub layout: Layout,
+    /// Full-size pixels per level-0 pixel: 2, or 4 for 4K.
+    scale0: u32,
     input: Vec<Tex>,
     pub slots: [Slot; 2],
-    /// Size of each pyramid level, and of its patch grid.
+    /// Size of each pyramid level, and of its patch grid (empty without frame generation).
     planes: Vec<(u32, u32)>,
     patches: Vec<(u32, u32)>,
+    fg: Option<Gen>,
+    /// Generated frames, used round-robin: a pair's frames are all made when it starts, and
+    /// some may still be waiting their turn when the next pair starts. Made as they're first
+    /// needed (`ensure_outs`), up to `OUTS`.
+    pub outs: Vec<Tex>,
+}
+
+/// The flow both ways (last pair's kept as candidates), its checks and the landing maps.
+struct Gen {
     seed: Tex,
     patch: Vec<Tex>,
     rough: Vec<Tex>,
@@ -543,12 +555,9 @@ pub struct Frames {
     fin: [Tex; 2],
     keys: [Tex; 2],
     counts: Tex,
-    /// Generated frames, used round-robin: a pair's frames are all made when it starts, and
-    /// some may still be waiting their turn when the next pair starts.
-    pub outs: Vec<Tex>,
 }
 
-/// Generated frames kept at once (each one frame in size): two pairs' worth at 30 -> 240.
+/// Most generated frames kept at once (each one frame in size): two pairs' worth at 30 -> 240.
 pub const OUTS: usize = 14;
 
 /// Lucas-Kanade steps per patch at level `l`. The finest level starts close (and is snapped to
@@ -560,8 +569,25 @@ fn lk_steps(l: usize) -> u32 {
 /// Stop the pyramid once a level is this narrow.
 const COARSEST_WIDTH: u32 = 100;
 
+/// Above this many pixels (more than 1440p), motion is measured from quarter size instead of
+/// half: a 4K picture's half size is 1080p, more detail than motion needs, and measuring it
+/// there costs about three times as much, which adds to the delay with smoothing on.
+const QUARTER_ABOVE: u32 = 2560 * 1440;
+
+fn level0_scale(w: u32, h: u32) -> u32 {
+    if w * h > QUARTER_ABOVE { 4 } else { 2 }
+}
+
 impl Frames {
+    /// With everything for frame generation, and all `OUTS` generated frames (the tests).
     pub fn new(gpu: &Gpu, w: u32, h: u32, layout: Layout) -> Result<Frames> {
+        let mut f = Frames::with(gpu, w, h, layout, true)?;
+        f.ensure_outs(gpu, OUTS)?;
+        Ok(f)
+    }
+
+    /// `fg`: with what frame generation needs (pyramids, flow), but no generated frames yet.
+    pub fn with(gpu: &Gpu, w: u32, h: u32, layout: Layout, fg: bool) -> Result<Frames> {
         let input = match layout {
             Layout::Nv12 => {
                 vec![gpu.tex(w, h, DXGI_FORMAT_R8_UNORM, false)?, gpu.tex(w / 2, h / 2, DXGI_FORMAT_R8G8_UNORM, false)?]
@@ -569,7 +595,11 @@ impl Frames {
             Layout::Yuy2 => vec![gpu.tex(w / 2, h, DXGI_FORMAT_R8G8B8A8_UNORM, false)?],
             Layout::Rgb32 => vec![gpu.tex(w, h, DXGI_FORMAT_B8G8R8A8_UNORM, false)?],
         };
-        let mut planes = vec![(w.div_ceil(2), h.div_ceil(2))];
+        let scale0 = level0_scale(w, h);
+        let mut planes = vec![(w.div_ceil(scale0), h.div_ceil(scale0))];
+        if !fg {
+            planes.clear();
+        }
         while let Some(&(pw, ph)) = planes.last()
             && pw > COARSEST_WIDTH
             && ph >= 32
@@ -577,30 +607,51 @@ impl Frames {
             planes.push((pw.div_ceil(2), ph.div_ceil(2)));
         }
         let patches: Vec<(u32, u32)> = planes.iter().map(|&(pw, ph)| (pw.div_ceil(4), ph.div_ceil(4))).collect();
-        let per_level = |sizes: &[(u32, u32)], fmt| -> Result<Vec<Tex>> {
-            sizes.iter().map(|&(pw, ph)| gpu.tex(pw, ph, fmt, true)).collect()
-        };
         let slot = || -> Result<Slot> {
             Ok(Slot {
                 frame: gpu.tex(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, true)?,
-                luma: per_level(&planes, DXGI_FORMAT_R32_FLOAT)?,
+                luma: per_level(gpu, &planes, DXGI_FORMAT_R32_FLOAT)?,
             })
         };
-        let flows = || -> Result<[Vec<Tex>; 2]> {
-            Ok([per_level(&planes, DXGI_FORMAT_R32G32_FLOAT)?, per_level(&planes, DXGI_FORMAT_R32G32_FLOAT)?])
-        };
+        let slots = [slot()?, slot()?];
+        let fg = if fg { Some(Gen::new(gpu, w, h, &planes, &patches)?) } else { None };
+        Ok(Frames { w, h, layout, scale0, input, slots, planes, patches, fg, outs: Vec::new() })
+    }
+
+    /// Whether this was made with frame generation.
+    pub fn has_gen(&self) -> bool {
+        self.fg.is_some()
+    }
+
+    /// Makes sure there are at least `n` generated frames (at most `OUTS`).
+    pub fn ensure_outs(&mut self, gpu: &Gpu, n: usize) -> Result<()> {
+        while self.outs.len() < n.min(OUTS) {
+            self.outs.push(gpu.tex(self.w, self.h, DXGI_FORMAT_R8G8B8A8_UNORM, true)?);
+        }
+        Ok(())
+    }
+
+    fn fg(&self) -> &Gen {
+        self.fg.as_ref().expect("made without frame generation")
+    }
+}
+
+fn per_level(gpu: &Gpu, sizes: &[(u32, u32)], fmt: DXGI_FORMAT) -> Result<Vec<Tex>> {
+    sizes.iter().map(|&(pw, ph)| gpu.tex(pw, ph, fmt, true)).collect()
+}
+
+impl Gen {
+    fn new(gpu: &Gpu, w: u32, h: u32, planes: &[(u32, u32)], patches: &[(u32, u32)]) -> Result<Gen> {
         let (p0w, p0h) = planes[0];
-        let level0 = || gpu.tex(p0w, p0h, DXGI_FORMAT_R32G32B32A32_FLOAT, true);
         let coarsest = *patches.last().expect("at least one level");
-        Ok(Frames {
-            w,
-            h,
-            layout,
-            input,
-            slots: [slot()?, slot()?],
+        let level0 = || gpu.tex(p0w, p0h, DXGI_FORMAT_R32G32B32A32_FLOAT, true);
+        let flows = || -> Result<[Vec<Tex>; 2]> {
+            Ok([per_level(gpu, planes, DXGI_FORMAT_R32G32_FLOAT)?, per_level(gpu, planes, DXGI_FORMAT_R32G32_FLOAT)?])
+        };
+        Ok(Gen {
             seed: gpu.tex(coarsest.0, coarsest.1, DXGI_FORMAT_R32G32B32A32_FLOAT, true)?,
-            patch: per_level(&patches, DXGI_FORMAT_R32G32B32A32_FLOAT)?,
-            rough: per_level(&planes, DXGI_FORMAT_R32G32_FLOAT)?,
+            patch: per_level(gpu, patches, DXGI_FORMAT_R32G32B32A32_FLOAT)?,
+            rough: per_level(gpu, planes, DXGI_FORMAT_R32G32_FLOAT)?,
             flow: [flows()?, flows()?],
             set: 0,
             temporal: false,
@@ -612,11 +663,11 @@ impl Frames {
             fin: [level0()?, level0()?],
             keys: [gpu.tex(w, h, DXGI_FORMAT_R32_UINT, true)?, gpu.tex(w, h, DXGI_FORMAT_R32_UINT, true)?],
             counts: gpu.tex(4, 1, DXGI_FORMAT_R32_UINT, true)?,
-            outs: (0..OUTS).map(|_| gpu.tex(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, true)).collect::<Result<_>>()?,
-            planes,
-            patches,
         })
     }
+}
+
+impl Frames {
 
     /// Uploads one packed frame: NV12 (Y then UV rows), YUY2 or top-down BGRA rows.
     pub fn upload(&self, gpu: &Gpu, data: &[u8]) -> Result<()> {
@@ -686,7 +737,11 @@ impl Frames {
         }
         let mut above = (self.w, self.h);
         for (l, &(pw, ph)) in self.planes.iter().enumerate() {
-            let p = Params { sz: [pw as i32, ph as i32, above.0 as i32, above.1 as i32], ..Default::default() };
+            let p = Params {
+                sz: [pw as i32, ph as i32, above.0 as i32, above.1 as i32],
+                misc: [0.0, self.scale0 as f32, 0.0, 0.0],
+                ..Default::default()
+            };
             let g = (groups(pw, 8), groups(ph, 8));
             if l == 0 {
                 gpu.run(&gpu.k.luma0, &p, &[(3, &s.frame)], &[(1, &s.luma[0])], g);
@@ -699,9 +754,10 @@ impl Frames {
 
     /// Measures motion between slots `a` and `b` (both decoded with pyramids), both ways.
     pub fn estimate(&mut self, gpu: &Gpu, a: usize, b: usize) {
-        unsafe { gpu.ctx.ClearUnorderedAccessViewUint(self.counts.uav.as_ref().expect("uav"), &[0; 4]) };
-        self.set = 1 - self.set;
-        let (cur, prev) = (self.set, 1 - self.set);
+        let fg = self.fg.as_mut().expect("made without frame generation");
+        unsafe { gpu.ctx.ClearUnorderedAccessViewUint(fg.counts.uav.as_ref().expect("uav"), &[0; 4]) };
+        fg.set = 1 - fg.set;
+        let (cur, prev) = (fg.set, 1 - fg.set);
         let n = self.planes.len();
         let pair = |dir: usize| {
             if dir == 0 { (&self.slots[a], &self.slots[b]) } else { (&self.slots[b], &self.slots[a]) }
@@ -721,22 +777,22 @@ impl Frames {
                 let luma = [(5, &sx.luma[l]), (6, &sy.luma[l])];
                 let pg = (gw, gh);
                 if l == n - 1 {
-                    gpu.run(&gpu.k.flow_full, &p, &luma, &[(2, &self.seed)], (gw, gh));
+                    gpu.run(&gpu.k.flow_full, &p, &luma, &[(2, &fg.seed)], (gw, gh));
                     p.fl[0] = F_SEED;
-                    gpu.run(&gpu.k.flow_patch, &p, &[luma[0], luma[1], (9, &self.seed)], &[(2, &self.patch[l])], pg);
+                    gpu.run(&gpu.k.flow_patch, &p, &[luma[0], luma[1], (9, &fg.seed)], &[(2, &fg.patch[l])], pg);
                 } else {
-                    if self.temporal {
+                    if fg.temporal {
                         p.fl[0] |= F_TEMPORAL;
                     }
                     if l == 0 && dir == 0 {
                         p.fl[0] |= F_COUNT;
                     }
-                    let srvs = [luma[0], luma[1], (7, &self.flow[cur][dir][l + 1]), (8, &self.flow[prev][dir][l])];
-                    gpu.run(&gpu.k.flow_patch, &p, &srvs, &[(2, &self.patch[l]), (4, &self.counts)], pg);
+                    let srvs = [luma[0], luma[1], (7, &fg.flow[cur][dir][l + 1]), (8, &fg.flow[prev][dir][l])];
+                    gpu.run(&gpu.k.flow_patch, &p, &srvs, &[(2, &fg.patch[l]), (4, &fg.counts)], pg);
                 }
                 let g = (groups(pw, 8), groups(ph, 8));
-                gpu.run(&gpu.k.flow_dense, &p, &[luma[0], luma[1], (9, &self.patch[l])], &[(3, &self.rough[l])], g);
-                gpu.run(&gpu.k.flow_smooth, &p, &[(10, &self.rough[l])], &[(3, &self.flow[cur][dir][l])], g);
+                gpu.run(&gpu.k.flow_dense, &p, &[luma[0], luma[1], (9, &fg.patch[l])], &[(3, &fg.rough[l])], g);
+                gpu.run(&gpu.k.flow_smooth, &p, &[(10, &fg.rough[l])], &[(3, &fg.flow[cur][dir][l])], g);
             }
         }
         let (pw, ph) = self.planes[0];
@@ -744,55 +800,66 @@ impl Frames {
         let g = (groups(pw, 8), groups(ph, 8));
         for dir in 0..2 {
             let (sx, sy) = pair(dir);
-            let srvs = [(5, &sx.luma[0]), (6, &sy.luma[0]), (10, &self.flow[cur][dir][0])];
-            gpu.run(&gpu.k.flow_snap, &p, &srvs, &[(3, &self.snapped[dir])], g);
+            let srvs = [(5, &sx.luma[0]), (6, &sy.luma[0]), (10, &fg.flow[cur][dir][0])];
+            gpu.run(&gpu.k.flow_snap, &p, &srvs, &[(3, &fg.snapped[dir])], g);
         }
         for dir in 0..2 {
             let (sx, sy) = pair(dir);
-            let srvs = [(5, &sx.luma[0]), (6, &sy.luma[0]), (10, &self.snapped[dir]), (11, &self.snapped[1 - dir])];
-            gpu.run(&gpu.k.flow_check, &p, &srvs, &[(2, &self.info[dir])], g);
+            let srvs = [(5, &sx.luma[0]), (6, &sy.luma[0]), (10, &fg.snapped[dir]), (11, &fg.snapped[1 - dir])];
+            gpu.run(&gpu.k.flow_check, &p, &srvs, &[(2, &fg.info[dir])], g);
         }
         // Filled motion goes through rough[0], free once the levels are done.
-        let pf = Params { sz: [pw as i32, ph as i32, self.w as i32, self.h as i32], ..Default::default() };
+        let pf = Params {
+            sz: [pw as i32, ph as i32, self.w as i32, self.h as i32],
+            misc: [0.0, self.scale0 as f32, 0.0, 0.0],
+            ..Default::default()
+        };
         for dir in 0..2 {
             let (sx, _) = pair(dir);
-            let srvs = [(10, &self.snapped[dir]), (20, &self.info[dir]), (21, &sx.frame)];
-            gpu.run(&gpu.k.flow_fill, &pf, &srvs, &[(3, &self.rough[0])], g);
-            gpu.run(&gpu.k.flow_final, &p, &[(10, &self.rough[0]), (20, &self.info[dir])], &[(2, &self.fin[dir])], g);
+            let srvs = [(10, &fg.snapped[dir]), (20, &fg.info[dir]), (21, &sx.frame)];
+            gpu.run(&gpu.k.flow_fill, &pf, &srvs, &[(3, &fg.rough[0])], g);
+            gpu.run(&gpu.k.flow_final, &p, &[(10, &fg.rough[0]), (20, &fg.info[dir])], &[(2, &fg.fin[dir])], g);
         }
-        self.temporal = true;
+        fg.temporal = true;
     }
 
     /// Forgets last pair's motion (after a jump in the picture).
     pub fn forget_motion(&mut self) {
-        self.temporal = false;
+        if let Some(fg) = self.fg.as_mut() {
+            fg.temporal = false;
+        }
     }
 
     /// Generates the frame at time `t` between slots `a` and `b` into generated frame `out`.
     pub fn interpolate(&self, gpu: &Gpu, a: usize, b: usize, t: f32, out: usize) {
-        for k in &self.keys {
+        let fg = self.fg();
+        for k in &fg.keys {
             unsafe { gpu.ctx.ClearUnorderedAccessViewUint(k.uav.as_ref().expect("uav"), &[u32::MAX; 4]) };
         }
-        let p = Params { sz: [self.w as i32, self.h as i32, 0, 0], misc: [t, 0.0, 0.0, 0.0], ..Default::default() };
-        let fin = [(12, &self.fin[0]), (13, &self.fin[1])];
+        let p = Params {
+            sz: [self.w as i32, self.h as i32, 0, 0],
+            misc: [t, self.scale0 as f32, 0.0, 0.0],
+            ..Default::default()
+        };
+        let fin = [(12, &fg.fin[0]), (13, &fg.fin[1])];
         let g = (groups(self.w, 16), groups(self.h, 16));
-        gpu.run_z(&gpu.k.project, &p, &fin, &[(5, &self.keys[0]), (6, &self.keys[1])], (g.0, g.1, 2));
+        gpu.run_z(&gpu.k.project, &p, &fin, &[(5, &fg.keys[0]), (6, &fg.keys[1])], (g.0, g.1, 2));
         let srvs = [
             fin[0],
             fin[1],
-            (14, &self.keys[0]),
-            (15, &self.keys[1]),
+            (14, &fg.keys[0]),
+            (15, &fg.keys[1]),
             (16, &self.slots[a].frame),
             (17, &self.slots[b].frame),
-            (18, &self.counts),
+            (18, &fg.counts),
         ];
         gpu.run(&gpu.k.compose, &p, &srvs, &[(7, &self.outs[out])], g);
     }
 
-    /// The finished half-size fields of direction `dir` (0: A -> B), per pixel: vector x, y,
+    /// The finished level-0 fields of direction `dir` (0: A -> B), per pixel: vector x, y,
     /// mismatch with the other direction, unreliability (tests only).
     pub fn fields(&self, gpu: &Gpu, dir: usize) -> Result<(Vec<[f32; 4]>, usize, usize)> {
-        let t = &self.fin[dir];
+        let t = &self.fg().fin[dir];
         let b = gpu.read(t, 16)?;
         let px = b
             .chunks_exact(16)
@@ -803,7 +870,7 @@ impl Frames {
 
     /// Cut-test counts (patches missed, textured patches), read back synchronously (tests only).
     pub fn counts(&self, gpu: &Gpu) -> Result<[u32; 4]> {
-        let b = gpu.read(&self.counts, 4)?;
+        let b = gpu.read(&self.fg().counts, 4)?;
         Ok([0, 1, 2, 3].map(|i| u32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])))
     }
 }
