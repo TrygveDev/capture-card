@@ -44,8 +44,6 @@ app the first time (the exe isn't code-signed): *More info › Run anyway*.
 | `H` | HDR input |
 | `O` | FPS counter: off → numbers → graphs |
 | `T` / `P` | Always on top |
-| `R` | Start / stop a test session (see below) |
-| `B` | Bookmark this moment in the session ("something looked wrong here") |
 
 The capture mode (resolution and frame rate), colour range, upscaling and updates are in the
 menu on the controls. Settings are saved in `%APPDATA%\Passthru\settings.json`, and a log of
@@ -100,9 +98,10 @@ every pull request is built and tested too (the exe is kept as a build artifact)
 
 ## Test sessions
 
-To find out what happened when something looked or felt wrong, record a session: press `R`
-in the app (or start it with `--record`), play, press `B` the moment anything looks off, and
-press `R` again to stop. A red REC badge shows while recording. Each session is a folder in
+A developer tool, off in normal use: start the app with `--dev` (or set the environment
+variable `PASSTHRU_DEV=1`) to enable it. To find out what happened when something looked or
+felt wrong, record a session: press `R` in the app (or start it with `--record`), play, press
+`B` the moment anything looks off, and press `R` again to stop. A red REC badge shows while recording. Each session is a folder in
 `%APPDATA%\Passthru\sessions\` with:
 
 - every card frame, every frame-generation pair (plan, GPU time, scene-cut and UI tests),

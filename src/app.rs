@@ -10,6 +10,18 @@ pub const EXE: &str = "passthru.exe";
 pub const DIR: &str = "Passthru";
 /// Releases come from here (the updater).
 pub const REPO: &str = "TrygveDev/passthru";
+/// Developer mode: test sessions (R to record, B to bookmark) and other tools for working on
+/// the app. Off for everyone else; on with `--dev` or the environment variable PASSTHRU_DEV=1
+/// (starting a recording with `--record` turns it on too).
+pub fn dev_mode() -> bool {
+    use std::sync::OnceLock;
+    static DEV: OnceLock<bool> = OnceLock::new();
+    *DEV.get_or_init(|| {
+        std::env::var("PASSTHRU_DEV").is_ok_and(|v| !v.is_empty() && v != "0")
+            || std::env::args().any(|a| a == "--dev" || a.starts_with("--record"))
+    })
+}
+
 /// The data folder before the rename (it's moved over once).
 const OLD_DIR: &str = "capture-card";
 

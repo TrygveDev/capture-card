@@ -1149,8 +1149,9 @@ impl Render for Viewer {
                     "s" => this.cycle_smooth(cx),
                     "o" => this.cycle_overlay(cx),
                     "t" | "p" => this.toggle_pin(cx),
-                    "r" => this.toggle_recording(window, cx),
-                    "b" => this.bookmark(cx),
+                    // Test sessions are a developer tool (`--dev`, see app::dev_mode).
+                    "r" if app::dev_mode() => this.toggle_recording(window, cx),
+                    "b" if app::dev_mode() => this.bookmark(cx),
                     "up" => {
                         this.set_volume(this.settings.volume + 0.05, cx);
                         this.settings.save();
@@ -1256,6 +1257,8 @@ fn parse_args() -> Args {
             "--cpu" => a.cpu = true,
             "--show-menu" => a.show_menu = true,
             // Test sessions (see telemetry.rs); R toggles one in the app too.
+            // Developer mode (test sessions, R and B); `--record` implies it.
+            "--dev" => {}
             "--record" => a.record = true,
             "--record-dir" => {
                 a.record = true;
