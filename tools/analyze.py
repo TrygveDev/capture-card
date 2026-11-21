@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyses capture-card test sessions (see src/telemetry.rs for what a session records).
+"""Analyses Passthru test sessions (see src/telemetry.rs for what a session records).
 
     python tools/analyze.py report [SESSION] [--open] [--no-thumbs]
         Writes SESSION/report.html: summary, timelines (frame times on screen, pacing, latency,
@@ -10,11 +10,11 @@
         Key numbers of two sessions side by side (before/after a change).
     python tools/analyze.py extract SESSION --at SECONDS [--out FILE]
         The card frames of the frame-generation pair at SECONDS as a .y4m clip, for
-        `capture-card --gpu-eval CLIP OUTDIR HELD`.
+        `passthru --gpu-eval CLIP OUTDIR HELD`.
     python tools/analyze.py list
     python tools/analyze.py marks VIDEO
         Decodes the present numbers from an output video's barcodes.
-    python tools/analyze.py selftest [CAPTURE_CARD_EXE]
+    python tools/analyze.py selftest [PASSTHRU_EXE]
         Checks the barcode reader against frames drawn by the app's own shader, encoded the
         way a session encodes them.
 
@@ -53,7 +53,7 @@ EPS = 0.0015
 
 def sessions_root() -> Path:
     base = os.environ.get("APPDATA") or tempfile.gettempdir()
-    return Path(base) / "capture-card" / "sessions"
+    return Path(base) / "Passthru" / "sessions"
 
 
 def newest_session() -> Path:
@@ -922,7 +922,7 @@ def cmd_extract(args):
     if r.returncode:
         sys.exit(r.stderr.decode(errors="replace"))
     print(f"pair ending at card frame {p['seq']} ({s.s(p['t_us']):.3f} s): frames {a_seq}..{p['seq']} -> {out}")
-    print(f"  capture-card --gpu-eval \"{out}\" OUTDIR {p['held']} 0")
+    print(f"  passthru --gpu-eval \"{out}\" OUTDIR {p['held']} 0")
 
 
 def cmd_list(args):
@@ -945,7 +945,7 @@ def cmd_marks(args):
 
 
 def cmd_selftest(args):
-    exe = Path(args.exe or Path(__file__).resolve().parents[1] / "target" / "release" / "capture-card.exe").resolve()
+    exe = Path(args.exe or Path(__file__).resolve().parents[1] / "target" / "release" / "passthru.exe").resolve()
     if not tool("ffmpeg"):
         sys.exit("ffmpeg not found")
     # An older build without --mark-test would start the app itself instead: check first.

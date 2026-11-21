@@ -1,5 +1,5 @@
 //! A short record of what happened this run (devices opened, modes, format changes, stalls,
-//! errors), in %APPDATA%\capture-card\log.txt next to the settings, so odd behaviour can be
+//! errors), in %APPDATA%\Passthru\log.txt next to the settings, so odd behaviour can be
 //! looked at afterwards: the installed app has no console. Each run starts a fresh file.
 //! Everything also goes to stderr.
 
@@ -15,7 +15,7 @@ static FILE: Mutex<Option<(std::fs::File, u64)>> = Mutex::new(None);
 static START: OnceLock<Instant> = OnceLock::new();
 
 pub fn path() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("APPDATA")?).join("capture-card").join("log.txt"))
+    Some(crate::app::data_dir()?.join("log.txt"))
 }
 
 /// Starts this run's log (the viewer only: tools and tests don't touch it).
@@ -28,7 +28,7 @@ pub fn start() {
     if let Ok(f) = std::fs::File::create(&p) {
         *FILE.lock().unwrap() = Some((f, 0));
     }
-    line(&format!("capture-card {} started", env!("CARGO_PKG_VERSION")));
+    line(&format!("{} {} started", crate::app::NAME, env!("CARGO_PKG_VERSION")));
 }
 
 pub fn line(msg: &str) {

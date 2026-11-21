@@ -11,12 +11,12 @@ fn main() {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "unknown".into());
-    println!("cargo:rustc-env=CAPTURE_CARD_COMMIT={commit}");
+    println!("cargo:rustc-env=PASSTHRU_COMMIT={commit}");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let mut res = winresource::WindowsResource::new();
         res.set_icon_with_id("assets/icon.ico", "1");
-        res.set("FileDescription", "Capture Card");
-        res.set("ProductName", "Capture Card");
+        res.set("FileDescription", "Passthru");
+        res.set("ProductName", "Passthru");
         res.compile().expect("compile Windows resources");
     }
 }

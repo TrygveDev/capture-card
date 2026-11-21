@@ -738,23 +738,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "capture-card"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "futures",
- "gpui",
- "image",
- "raw-window-handle",
- "rayon",
- "serde",
- "serde_json",
- "windows 0.61.3",
- "windows-core 0.61.2",
- "winresource",
-]
-
-[[package]]
 name = "cbc"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3688,6 +3671,23 @@ dependencies = [
  "redox_syscall 0.5.18",
  "smallvec",
  "windows-link 0.2.1",
+]
+
+[[package]]
+name = "passthru"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "gpui",
+ "image",
+ "raw-window-handle",
+ "rayon",
+ "serde",
+ "serde_json",
+ "windows 0.61.3",
+ "windows-core 0.61.2",
+ "winresource",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod app;
 mod audio;
 mod convert;
 mod gpu;
@@ -13,6 +14,7 @@ mod present;
 mod settings;
 mod spring;
 mod telemetry;
+mod update;
 mod upscale;
 mod video;
 mod winutil;
@@ -116,6 +118,9 @@ struct Viewer {
     record_pending: bool,
     /// The controls' slide: 0 in place, 1 out of view below; whether it's moving, when it was
     /// last stepped, and whether Windows wants animations at all.
+    /// Updates from GitHub, and the state last shown (a notice when one is ready).
+    updater: std::sync::Arc<update::Updater>,
+    update_seen: update::State,
     bar: spring::Spring,
     bar_moving: bool,
     bar_at: Instant,
@@ -289,6 +294,14 @@ impl Viewer {
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.tick_stats(cx);
         self.tick_overlay(cx);
+        let update = self.updater.state();
+        if update != self.update_seen {
+            if let update::State::Ready(v) = &update {
+                self.toast(format!("Passthru {v} is ready: it starts next time (or restart from the menu)"));
+            }
+            self.update_seen = update;
+            cx.notify();
+        }
         // `--record`: once the video is drawing (the session records what it shows).
         if self.record_pending && (self.video.gpu.ready.load(Ordering::Acquire) || self.started_long_ago()) {
             self.record_pending = false;
@@ -443,6 +456,14 @@ impl Viewer {
         cx.notify();
     }
 
+    fn toggle_auto_update(&mut self, cx: &mut Context<Self>) {
+        self.settings.auto_update = !self.settings.auto_update;
+        self.settings.save();
+        // Turned on: check now.
+        self.updater = update::spawn(self.settings.auto_update, self.settings.auto_update);
+        cx.notify();
+    }
+
     fn toggle_rtx(&mut self, cx: &mut Context<Self>) {
         self.settings.rtx = !self.settings.rtx;
         telemetry::note("setting", || format!("rtx {}", self.settings.rtx));
@@ -457,7 +478,7 @@ impl Viewer {
         let info = serde_json::json!({
             "app": {
                 "version": env!("CARGO_PKG_VERSION"),
-                "commit": env!("CAPTURE_CARD_COMMIT"),
+                "commit": env!("PASSTHRU_COMMIT"),
                 "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
                 "args": std::env::args().skip(1).collect::<Vec<_>>(),
             },
@@ -551,7 +572,7 @@ impl Viewer {
         let control = &self.video.control;
         let offered = control.modes.lock().unwrap().clone();
         let wanted = *control.wanted.lock().unwrap();
-        let header = |text: &'static str| {
+        let header = |text: SharedString| {
             div()
                 .px(px(10.))
                 .pt(px(8.))
@@ -608,7 +629,7 @@ impl Viewer {
             .bg(rgba(0x121212f5))
             .border_1()
             .border_color(rgba(0xffffff1a))
-            .child(header("CAPTURE MODE"))
+            .child(header("CAPTURE MODE".into()))
             .child(
                 item(
                     "mode-auto".into(),
@@ -681,13 +702,26 @@ impl Viewer {
             }
             (true, present::Scaling::NotUp) => "Used when the video is enlarged to fit".to_string(),
         };
+        let update_state = self.updater.state();
+        let ready = match &update_state {
+            update::State::Ready(v) => Some(v.clone()),
+            _ => None,
+        };
+        let update_text = match update_state {
+            update::State::Off("not installed") => "Only the installed app updates itself".to_string(),
+            update::State::Off(_) => "Off".to_string(),
+            update::State::Checking => "Checking for a new version…".to_string(),
+            update::State::UpToDate => "Up to date".to_string(),
+            update::State::Ready(v) => format!("{v} downloaded: it starts next time"),
+            update::State::Failed(e) => format!("Couldn't check: {}", e.chars().take(80).collect::<String>()),
+        };
         let range = self.settings.range;
         let ranges = [
             (video::ColourRange::Auto, "Auto", control.auto_range_text()),
             (video::ColourRange::Limited, "Limited", "16–235, the video standard".to_string()),
             (video::ColourRange::Full, "Full", "0–255, the PS5's SDR output".to_string()),
         ];
-        menu = menu.child(div().h(px(1.)).mx(px(6.)).my(px(4.)).bg(rgba(0xffffff1a))).child(header("COLOUR RANGE"));
+        menu = menu.child(div().h(px(1.)).mx(px(6.)).my(px(4.)).bg(rgba(0xffffff1a))).child(header("COLOUR RANGE".into()));
         for (choice, label, detail) in ranges {
             menu = menu.child(
                 item(("range", choice as usize).into(), label.into(), Some(detail), range == choice)
@@ -695,11 +729,27 @@ impl Viewer {
             );
         }
         menu.child(div().h(px(1.)).mx(px(6.)).my(px(4.)).bg(rgba(0xffffff1a)))
-            .child(header("UPSCALING"))
+            .child(header("UPSCALING".into()))
             .child(
                 item("rtx".into(), "RTX Video Super Resolution".into(), Some(rtx_state), self.settings.rtx)
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_rtx(cx))),
             )
+            .child(div().h(px(1.)).mx(px(6.)).my(px(4.)).bg(rgba(0xffffff1a)))
+            .child(header(format!("{} {}", app::NAME.to_uppercase(), env!("CARGO_PKG_VERSION")).into()))
+            .child(
+                item("autoupdate".into(), "Update automatically".into(), Some(update_text), self.settings.auto_update)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_auto_update(cx))),
+            )
+            .children(ready.map(|v| {
+                item("restart".into(), format!("Restart now to use {v}"), None, false).on_click(cx.listener(
+                    |_, _, _, cx| {
+                        if update::restart().is_ok() {
+                            telemetry::stop();
+                            cx.quit();
+                        }
+                    },
+                ))
+            }))
     }
 
     fn volume_from_x(&mut self, x: Pixels, cx: &mut Context<Self>) {
@@ -1348,7 +1398,17 @@ fn main() {
         return;
     }
 
+    // Started from Downloads or similar with a normal double-click: offer to install (not for
+    // dev builds, or runs with options, which are tests and tools).
+    let dev_build = std::env::current_exe().is_ok_and(|p| p.components().any(|c| c.as_os_str() == "target"));
+    if argv.len() == 1 && !cfg!(debug_assertions) && !dev_build && install::offer() {
+        return;
+    }
     log::start();
+    if install::running_installed() {
+        update::clean_up();
+        install::refresh_registration();
+    }
     let mut settings = Settings::load();
     if let Some(s) = args.smooth {
         settings.smooth_for_run(s);
@@ -1378,6 +1438,7 @@ fn main() {
     video.control.set_range(settings.range);
     video.meter.set_on(settings.overlay != Overlay::Off);
     let audio = AudioShared::new(settings.volume, settings.muted);
+    let updater = update::spawn(settings.auto_update, false);
     video::spawn(video.clone(), args.video);
     audio::spawn(audio.clone(), args.audio);
     let (stats_enabled, exit_after, start_fullscreen) = (args.stats, args.exit_after, args.fullscreen);
@@ -1397,13 +1458,13 @@ fn main() {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
-                title: Some("Capture Card".into()),
+                title: Some(app::NAME.into()),
                 appears_transparent: true,
                 traffic_light_position: None,
             }),
             window_min_size: Some(size(px(320.), px(180.))),
             window_background: WindowBackgroundAppearance::Opaque,
-            app_id: Some("capture-card".into()),
+            app_id: Some("passthru".into()),
             ..Default::default()
         };
         cx.open_window(options, |window, cx| {
@@ -1476,6 +1537,8 @@ fn main() {
                     graphs: None,
                     record: record_opts.clone(),
                     record_pending: record_now,
+                    updater,
+                    update_seen: update::State::Off(""),
                     bar: spring::Spring::at(1.0),
                     bar_moving: false,
                     bar_at: Instant::now(),

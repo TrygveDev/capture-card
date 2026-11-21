@@ -115,9 +115,9 @@ fn compile(entry: &str, target: &str) -> Result<Vec<u8>> {
     let target_c = format!("{target}\0");
     let mut blob: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
-    // Development: CAPTURE_CARD_HLSL=FILE compiles that file instead of the built-in shaders
+    // Development: PASSTHRU_HLSL=FILE compiles that file instead of the built-in shaders
     // (tuning against recorded clips without rebuilding).
-    let file = std::env::var("CAPTURE_CARD_HLSL").ok().and_then(|p| std::fs::read_to_string(p).ok());
+    let file = std::env::var("PASSTHRU_HLSL").ok().and_then(|p| std::fs::read_to_string(p).ok());
     let source = file.as_deref().unwrap_or(SOURCE);
     let r = unsafe {
         D3DCompile(
@@ -620,7 +620,7 @@ pub enum FlowMethod {
 }
 
 /// The method to use: the hardware if `hardware` (the setting), else the shader;
-/// `CAPTURE_CARD_FLOW=shader|hw|hw-refined` overrides it (for comparing). Hardware falls back
+/// `PASSTHRU_FLOW=shader|hw|hw-refined` overrides it (for comparing). Hardware falls back
 /// to the shader where it isn't available.
 ///
 /// An experiment, off unless asked for. Measured on real 4K capture (10 clips of play, a
@@ -630,7 +630,7 @@ pub enum FlowMethod {
 /// 30 -> 120 on 240 Hz only 75% of frames kept the steady two refreshes (shader: 99.5%) and
 /// latency rose 10 ms. Worth it only with its own queue and cross-queue synchronisation.
 pub fn flow_method(hardware: bool) -> FlowMethod {
-    match std::env::var("CAPTURE_CARD_FLOW").as_deref() {
+    match std::env::var("PASSTHRU_FLOW").as_deref() {
         Ok("hw") => FlowMethod::Hardware,
         Ok("hw-refined") => FlowMethod::HardwareRefined,
         Ok("shader") => FlowMethod::Shader,
@@ -659,10 +659,10 @@ struct Hw {
 
 impl Hw {
     fn new(gpu: &Gpu, w: u32, h: u32, scale0: u32, patches0: (u32, u32), refine: bool) -> Result<Hw> {
-        // Experiments: CAPTURE_CARD_NVOF_PERF (5 slow/best, 10, 20 fast) and _DIV (input at
+        // Experiments: PASSTHRU_NVOF_PERF (5 slow/best, 10, 20 fast) and _DIV (input at
         // 1/DIV size).
         let env = |k: &str, d: u32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        let (perf, div) = (env("CAPTURE_CARD_NVOF_PERF", 10), env("CAPTURE_CARD_NVOF_DIV", 1).max(1));
+        let (perf, div) = (env("PASSTHRU_NVOF_PERF", 10), env("PASSTHRU_NVOF_DIV", 1).max(1));
         let (w, h) = (w.div_ceil(div), h.div_ceil(div));
         // A vector per level-0 pixel at most (finer would only be averaged away).
         let mut flow = crate::nvof::Flow::new(&gpu.device, &gpu.ctx, (w, h), (scale0 / div).max(1), perf)?;
@@ -692,8 +692,8 @@ const COARSEST_WIDTH: u32 = 100;
 const QUARTER_ABOVE: u32 = 2560 * 1440;
 
 fn level0_scale(w: u32, h: u32) -> u32 {
-    // Experiments: CAPTURE_CARD_SCALE0=2|4.
-    if let Some(s) = std::env::var("CAPTURE_CARD_SCALE0").ok().and_then(|v| v.parse().ok()).filter(|&s| s == 2 || s == 4) {
+    // Experiments: PASSTHRU_SCALE0=2|4.
+    if let Some(s) = std::env::var("PASSTHRU_SCALE0").ok().and_then(|v| v.parse().ok()).filter(|&s| s == 2 || s == 4) {
         return s;
     }
     if w * h > QUARTER_ABOVE { 4 } else { 2 }

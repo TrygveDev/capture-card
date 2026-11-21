@@ -1,5 +1,5 @@
 //! Volume, mute, HDR, smoothing, the FPS counter, capture mode, upscaling, always-on-top and
-//! window placement, kept in %APPDATA%\capture-card\settings.json.
+//! window placement, kept in %APPDATA%\Passthru\settings.json.
 
 use std::path::PathBuf;
 
@@ -21,6 +21,8 @@ pub struct Settings {
     pub mode: Option<[u32; 3]>,
     /// Upscale with RTX Video Super Resolution when it's available (else Lanczos).
     pub rtx: bool,
+    /// The installed app checks GitHub for new releases (at most daily) and updates itself.
+    pub auto_update: bool,
     /// The signal's colour range: detected, or forced limited or full.
     pub range: crate::video::ColourRange,
     /// Last windowed position and size in logical pixels: x, y, width, height.
@@ -49,6 +51,7 @@ impl Default for Settings {
             overlay: Overlay::Off,
             mode: None,
             rtx: true,
+            auto_update: true,
             range: crate::video::ColourRange::Auto,
             window: None,
             run_only: RunOnly::default(),
@@ -57,7 +60,7 @@ impl Default for Settings {
 }
 
 fn path() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("APPDATA")?).join("capture-card").join("settings.json"))
+    Some(crate::app::data_dir()?.join("settings.json"))
 }
 
 impl Settings {

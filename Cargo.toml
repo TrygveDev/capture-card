@@ -1,10 +1,10 @@
 [package]
-name = "capture-card"
-version = "0.1.0"
+name = "passthru"
+version = "0.2.0"
 edition = "2024"
-description = "Minimal, low-latency capture card viewer"
+description = "Lightweight, low-latency capture card viewer with GPU frame generation"
 license = "PolyForm-Noncommercial-1.0.0"
-repository = "https://github.com/TrygveDev/capture-card"
+repository = "https://github.com/TrygveDev/passthru"
 
 [dependencies]
 gpui = "0.2.2"
@@ -47,6 +47,8 @@ features = [
     "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",
     "Win32_System_LibraryLoader",
+    "Win32_Networking_WinHttp",
+    "Win32_Security_Cryptography",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ]

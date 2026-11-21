@@ -1,7 +1,7 @@
 //! Test sessions: everything the app does, recorded so it can be analysed afterwards
 //! (`tools/analyze.py` turns a session into a report).
 //!
-//! A session is a folder (`%APPDATA%\capture-card\sessions\<date>_<time>` unless given) with:
+//! A session is a folder (`%APPDATA%\Passthru\sessions\<date>_<time>` unless given) with:
 //! - `session.json`: the app, machine, display, device, settings, and what was recorded;
 //! - `capture.csv`: every card frame (arrival, copy time, its frame in `input_*.mkv`);
 //! - `frames.csv`: what the presenter made of each card frame (new picture, repeat, restart...);
@@ -260,11 +260,7 @@ pub fn status() -> Option<(PathBuf, Duration)> {
 }
 
 fn sessions_root() -> PathBuf {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("capture-card")
-        .join("sessions")
+    crate::app::data_dir().unwrap_or_else(std::env::temp_dir).join("sessions")
 }
 
 /// Starts a session. Returns its folder.
@@ -596,7 +592,7 @@ struct Ffmpeg {
 fn ffmpeg() -> Option<&'static Ffmpeg> {
     static FF: OnceLock<Option<Ffmpeg>> = OnceLock::new();
     FF.get_or_init(|| {
-        let path = std::env::var_os("CAPTURE_CARD_FFMPEG").map(PathBuf::from).unwrap_or_else(|| "ffmpeg".into());
+        let path = std::env::var_os("PASSTHRU_FFMPEG").map(PathBuf::from).unwrap_or_else(|| "ffmpeg".into());
         let out = Command::new(&path)
             .args(["-hide_banner", "-encoders"])
             .creation_flags(CREATE_NO_WINDOW)
@@ -1127,7 +1123,7 @@ mod tests {
     #[test]
     fn a_session_records_every_stream_and_samples_the_system() {
         let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join("capture-card-telemetry-test");
+        let dir = std::env::temp_dir().join("passthru-telemetry-test");
         session(&dir, false);
         assert!(on());
         let t = Instant::now();
@@ -1168,7 +1164,7 @@ mod tests {
     #[ignore]
     fn the_input_video_has_one_frame_per_card_frame() {
         let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join("capture-card-telemetry-video-test");
+        let dir = std::env::temp_dir().join("passthru-telemetry-video-test");
         let free: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
         let back = free.clone();
         input_format((256, 144, Layout::Nv12), 60.0, || Arc::new(move |b| back.lock().unwrap().push(b)));
