@@ -11,8 +11,8 @@ optionally smooth it with frame generation.
    Installed apps (no admin rights needed). Say no to just run it once.
 3. That's it. The installed app keeps itself up to date: it checks for a new release once a
    day, downloads it in the background (checked against its published SHA-256), and the new
-   version starts the next time you open it (or right away, from the menu). Turn it off in the
-   menu under *Update automatically*.
+   version starts the next time you open it (or right away, from Settings). Turn it off in
+   Settings under *Update automatically*.
 
 Uninstall it like any other app, from Installed apps. Windows may warn about an unrecognised
 app the first time (the exe isn't code-signed): *More info › Run anyway*.
@@ -31,6 +31,10 @@ app the first time (the exe isn't code-signed): *More info › Run anyway*.
 - **FPS counter** with frame-time graphs, showing the game's own rate next to the displayed rate.
 - A borderless window with no clutter: drag anywhere to move, edges keep the aspect ratio, and
   the controls hide when the mouse is still. Always-on-top and fullscreen are one key away.
+- **Hidden from recordings**: the controls stay out of screenshots, OBS and Discord (they see
+  only the video), on Windows 10 2004 and later.
+- **Ready when the console is**: Passthru can wait in the tray, start with Windows, open when a
+  signal arrives and close again when it's gone. While it waits it draws and plays nothing.
 
 ## Keys
 
@@ -45,8 +49,21 @@ app the first time (the exe isn't code-signed): *More info › Run anyway*.
 | `O` | FPS counter: off → numbers → graphs |
 | `T` / `P` | Always on top |
 
-The capture mode (resolution and frame rate), colour range, upscaling and updates are in the
-menu on the controls. Settings are saved in `%APPDATA%\Passthru\settings.json`, and a log of
+The capture mode (resolution and frame rate), colour range and upscaling are in the mode menu
+on the controls; the window, the background and updates are under the gear (Settings):
+
+| Setting | What it does |
+| --- | --- |
+| Always on top | Keeps the window above others (also `T`) |
+| Open in fullscreen | Goes fullscreen whenever the window opens |
+| Hide controls from recordings | Screenshots, OBS and Discord see only the video (on by default) |
+| Open when a signal arrives | Closing the window leaves Passthru in the tray; it opens again when the console sends a picture |
+| Close when the signal is lost | After 10 s without a signal: back to the tray, or quit if it isn't waiting there |
+| Start with Windows | Starts in the tray at sign-in (installed app only) |
+| Update automatically | Checks GitHub about once a day; *Check for updates* checks now |
+
+Only one Passthru runs at a time: opening it again brings up the one already running (in the
+tray, say). Settings are saved in `%APPDATA%\Passthru\settings.json`, and a log of
 the last run is next to it in `log.txt`.
 
 ## Tips for the lowest delay

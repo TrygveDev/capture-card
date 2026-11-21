@@ -113,6 +113,9 @@ pub struct Shared {
     pub flow_in_use: AtomicU8,
     /// The display's refresh rate in whole Hz (0 = not known yet).
     pub refresh_hz: AtomicU32,
+    /// The window is hidden (Passthru waits in the tray): frames are dropped as they come,
+    /// with no GPU work at all.
+    pub paused: AtomicBool,
 }
 
 /// How the video is being scaled to the window.
@@ -141,6 +144,7 @@ impl Shared {
             hw_flow: AtomicBool::new(hw_flow),
             flow_in_use: AtomicU8::new(0),
             refresh_hz: AtomicU32::new(0),
+            paused: AtomicBool::new(false),
         }
     }
 
@@ -646,6 +650,20 @@ fn run(shared: &VideoShared, rx: Receiver<RawFrame>, spare: Spare) -> Result<()>
     while rx.try_recv().is_ok() {}
 
     loop {
+        if shared.gpu.paused.load(Ordering::Relaxed) {
+            v.queue.clear();
+            if let Some(raw) = v.deferred.take() {
+                v.spare.give(raw.data);
+            }
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(raw) => v.spare.give(raw.data),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+            // Coming back, the next picture starts afresh (no stale cadence).
+            v.last_at = None;
+            continue;
+        }
         let msg = if v.queue.is_empty() {
             match rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(m) => Some(m),

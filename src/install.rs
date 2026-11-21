@@ -111,9 +111,32 @@ pub fn refresh_registration() {
     }
 }
 
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+
+/// Starts the installed copy with Windows, in the background (`--background`: it waits in the
+/// tray for a signal), or stops doing so. Only for the installed copy, which stays put.
+pub fn set_autostart(on: bool) -> Result<()> {
+    use windows::Win32::System::Registry::RegDeleteKeyValueW;
+    if on {
+        let exe = installed_exe()?;
+        let key = create_key(RUN_KEY)?;
+        let result = set_string(key, NAME, &format!("\"{}\" --background", exe.display()));
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
+        result
+    } else {
+        unsafe {
+            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, &HSTRING::from(RUN_KEY), &HSTRING::from(NAME));
+        }
+        Ok(())
+    }
+}
+
 /// Starts the installed copy (after installing from elsewhere).
 pub fn launch_installed() -> Result<()> {
-    std::process::Command::new(installed_exe()?).spawn().context("starting the installed app")?;
+    // `--restarted`: it waits for this process to exit (one Passthru at a time).
+    std::process::Command::new(installed_exe()?).arg("--restarted").spawn().context("starting the installed app")?;
     Ok(())
 }
 
@@ -166,6 +189,8 @@ pub fn install() -> Result<()> {
     if target.exists() && target.canonicalize()? == current {
         // Already running the installed copy: just (re)register it.
     } else {
+        // One waiting in the tray holds the exe open: ask it to quit first.
+        crate::instance::quit_running();
         std::fs::copy(&current, &target)
             .with_context(|| format!("copying to {} (is Passthru still open?)", target.display()))?;
     }
@@ -337,6 +362,7 @@ pub fn uninstall(quiet: bool) -> Result<()> {
         let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(APP_PATHS_KEY));
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
     }
+    let _ = set_autostart(false);
 
     let dir = install_dir()?;
     let exe = installed_exe()?;

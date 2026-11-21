@@ -1,5 +1,5 @@
-//! Volume, mute, HDR, smoothing, the FPS counter, capture mode, upscaling, always-on-top and
-//! window placement, kept in %APPDATA%\Passthru\settings.json.
+//! Volume, mute, HDR, smoothing, the FPS counter, capture mode, upscaling, the settings menu's
+//! switches and window placement, kept in %APPDATA%\Passthru\settings.json.
 
 use std::path::PathBuf;
 
@@ -23,6 +23,16 @@ pub struct Settings {
     pub rtx: bool,
     /// The installed app checks GitHub for new releases (at most daily) and updates itself.
     pub auto_update: bool,
+    /// Go fullscreen whenever the window opens.
+    pub start_fullscreen: bool,
+    /// Wait in the tray (closing the window hides it) and open when a signal arrives.
+    pub open_on_signal: bool,
+    /// Close the window once the signal has been gone a while (to the tray, if waiting there).
+    pub close_on_signal_loss: bool,
+    /// Start with Windows, in the tray (the installed app only).
+    pub start_with_windows: bool,
+    /// Keep the controls out of screenshots, recordings and streams (OBS, Discord...).
+    pub hide_from_capture: bool,
     /// The signal's colour range: detected, or forced limited or full.
     pub range: crate::video::ColourRange,
     /// Last windowed position and size in logical pixels: x, y, width, height.
@@ -52,6 +62,11 @@ impl Default for Settings {
             mode: None,
             rtx: true,
             auto_update: true,
+            start_fullscreen: false,
+            open_on_signal: false,
+            close_on_signal_loss: false,
+            start_with_windows: false,
+            hide_from_capture: true,
             range: crate::video::ColourRange::Auto,
             window: None,
             run_only: RunOnly::default(),
@@ -63,12 +78,19 @@ fn path() -> Option<PathBuf> {
     Some(crate::app::data_dir()?.join("settings.json"))
 }
 
+fn parse(bytes: &[u8]) -> Option<Settings> {
+    // Saved by some editors with a byte order mark, which JSON doesn't allow.
+    serde_json::from_slice(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)).ok()
+}
+
 impl Settings {
+    /// Passthru keeps running in the tray when its window is closed.
+    pub fn stays_in_tray(&self) -> bool {
+        self.open_on_signal || self.start_with_windows
+    }
+
     pub fn load() -> Self {
-        path()
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        path().and_then(|p| std::fs::read(p).ok()).and_then(|b| parse(&b)).unwrap_or_default()
     }
 
     /// Smoothing for this run, without saving it (`--smooth`).
@@ -113,6 +135,12 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_files_with_a_byte_order_mark() {
+        let s = parse(b"\xEF\xBB\xBF{\"volume\": 0.25, \"open_on_signal\": true}").unwrap();
+        assert_eq!((s.volume, s.open_on_signal, s.hide_from_capture), (0.25, true, true));
+    }
 
     #[test]
     fn run_only_values_are_not_saved() {

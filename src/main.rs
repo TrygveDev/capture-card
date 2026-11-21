@@ -6,6 +6,7 @@ mod convert;
 mod gpu;
 mod gputest;
 mod install;
+mod instance;
 mod log;
 mod meter;
 mod nvof;
@@ -55,6 +56,13 @@ const TICK: Duration = Duration::from_millis(30);
 /// the bottom, and their shadow).
 const BAR_TRAVEL: f32 = 76.0;
 
+/// "Close when the signal is lost" waits this long: a console switching resolution or HDR
+/// drops the signal for a few seconds.
+const CLOSE_AFTER_LOSS: Duration = Duration::from_secs(10);
+/// A Passthru left running in the tray looks for updates this often (the check itself is
+/// throttled to about daily).
+const UPDATE_EVERY: Duration = Duration::from_secs(6 * 3600);
+
 /// Messages top right stay this long.
 const TOAST_FOR: Duration = Duration::from_millis(3000);
 
@@ -64,9 +72,7 @@ const ICON_VOLUME_LOW: &str = "\u{E993}";
 const ICON_MUTE: &str = "\u{E74F}";
 const ICON_FULLSCREEN: &str = "\u{E740}";
 const ICON_EXIT_FULLSCREEN: &str = "\u{E73F}";
-const ICON_PIN: &str = "\u{E718}";
-/// Segoe Fluent "PinFill": the pin's solid head, drawn under `ICON_PIN` when pinned.
-const ICON_PINNED: &str = "\u{E841}";
+const ICON_SETTINGS: &str = "\u{E713}";
 const ICON_CLOSE: &str = "\u{E8BB}";
 const ICON_CHECK: &str = "\u{E73E}";
 const ICON_CHEVRON_UP: &str = "\u{E70E}";
@@ -96,8 +102,8 @@ struct Viewer {
     controls_visible: bool,
     cursor_hidden: bool,
     dragging_volume: bool,
-    /// The capture mode menu above the controls is open.
-    menu_open: bool,
+    /// The menu open above the controls, if any.
+    menu_open: Option<Menu>,
     /// Debug (`--show-menu`): the controls and menu stay up.
     show_menu: bool,
     /// What the controls last showed: mode, frame size, modes offered, scaling, range.
@@ -128,6 +134,54 @@ struct Viewer {
     bookmarks: u32,
     rec_second: Option<u64>,
     toast: Option<(String, Instant)>,
+    /// When the update check last started (one left running in the tray checks again).
+    updater_at: Instant,
+    /// The window is on screen (not waiting in the tray), and has been at least once.
+    window_shown: bool,
+    placed: bool,
+    /// The main window is fullscreen (the controls' window can't tell).
+    fullscreen: bool,
+    /// The controls' window has something on it (else it needn't redraw).
+    controls_drawn: bool,
+    /// To the main window: requests from the controls (see `request`).
+    requests: futures::channel::mpsc::UnboundedSender<winutil::Event>,
+    /// The signal as `tick` last saw it, and when it went.
+    signal_on: bool,
+    signal_lost_at: Option<Instant>,
+}
+
+/// The controls' window: draws what `Viewer::render_controls` gives.
+struct ControlsView {
+    viewer: gpui::Entity<Viewer>,
+}
+
+impl ControlsView {
+    fn new(viewer: gpui::Entity<Viewer>, cx: &mut Context<Self>) -> Self {
+        // Redraw with the viewer, while there's something to draw (or to take away).
+        cx.observe(&viewer, |_, viewer, cx| {
+            let v = viewer.read(cx);
+            if v.controls_visible || v.controls_drawn || v.toast.is_some() || telemetry::status().is_some() {
+                cx.notify();
+            }
+        })
+        .detach();
+        ControlsView { viewer }
+    }
+}
+
+impl Render for ControlsView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.viewer.update(cx, |v, cx| v.render_controls(window, cx))
+    }
+}
+
+/// The menus above the controls.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Menu {
+    /// Capture mode, colour range, upscaling.
+    Mode,
+    /// The window, the background, updates.
+    Settings,
 }
 
 /// Frame-rate and latency counters, printed every few seconds with `--stats` (always in dev
@@ -297,10 +351,17 @@ impl Viewer {
         let update = self.updater.state();
         if update != self.update_seen {
             if let update::State::Ready(v) = &update {
-                self.toast(format!("Passthru {v} is ready: it starts next time (or restart from the menu)"));
+                self.toast(format!("Passthru {v} is ready: it starts next time (or restart from Settings)"));
             }
             self.update_seen = update;
             cx.notify();
+        }
+        if self.settings.auto_update
+            && self.updater_at.elapsed() >= UPDATE_EVERY
+            && matches!(self.update_seen, update::State::UpToDate | update::State::Failed(_))
+        {
+            self.updater = update::spawn(true, false);
+            self.updater_at = Instant::now();
         }
         // `--record`: once the video is drawing (the session records what it shows).
         if self.record_pending && (self.video.gpu.ready.load(Ordering::Acquire) || self.started_long_ago()) {
@@ -311,6 +372,14 @@ impl Viewer {
         let toast_live = self.toast.as_ref().is_some_and(|(_, at)| at.elapsed() < TOAST_FOR + TICK);
         if second != self.rec_second || toast_live {
             self.rec_second = second;
+            cx.notify();
+        }
+        self.tick_signal(window, cx);
+        if !self.window_shown {
+            return;
+        }
+        if window.is_fullscreen() != self.fullscreen {
+            self.fullscreen = !self.fullscreen;
             cx.notify();
         }
         let Some(hwnd) = self.hwnd else { return };
@@ -340,12 +409,12 @@ impl Viewer {
         };
         let visible = self.dragging_volume
             || self.show_menu
-            || (cursor.is_some() && (over_pill || self.menu_open || self.last_move.elapsed() < IDLE_HIDE));
+            || (cursor.is_some() && (over_pill || self.menu_open.is_some() || self.last_move.elapsed() < IDLE_HIDE));
         if visible != self.controls_visible {
             self.controls_visible = visible;
             if !visible {
                 self.pill_bounds.set(None);
-                self.menu_open = false;
+                self.menu_open = None;
             }
             cx.notify();
         }
@@ -375,6 +444,148 @@ impl Viewer {
                 cx.notify();
             }
         }
+    }
+
+    /// Opens the window when a signal arrives and closes it once the signal has been gone a
+    /// while, as the settings menu says.
+    fn tick_signal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let signal = self.has_signal();
+        if signal != self.signal_on {
+            self.signal_on = signal;
+            self.signal_lost_at = (!signal).then(Instant::now);
+            if signal && !self.window_shown && self.settings.open_on_signal {
+                log::line("signal: arrived, opening the window");
+                self.show_window(window, cx);
+            }
+        }
+        if self.window_shown
+            && self.settings.close_on_signal_loss
+            && self.signal_lost_at.is_some_and(|t| t.elapsed() >= CLOSE_AFTER_LOSS)
+        {
+            self.signal_lost_at = None;
+            log::line("signal: gone, closing the window");
+            self.close(window, cx);
+        }
+    }
+
+    /// Shows the tray icon while Passthru can wait there (or is waiting there).
+    fn sync_tray(&self) {
+        if let Some(h) = self.hwnd {
+            winutil::set_tray(h, self.settings.stays_in_tray() || !self.window_shown);
+        }
+    }
+
+    /// Brings the window up (from the tray, or to the front).
+    fn show_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(h) = self.hwnd else { return };
+        let was_hidden = !self.window_shown;
+        self.window_shown = true;
+        self.video.gpu.paused.store(false, Ordering::Relaxed);
+        self.audio.muted.store(self.settings.muted, Ordering::Relaxed);
+        // Started hidden, the window's first showing is gpui's (activate_window puts it where
+        // it was last); after that it's shown here.
+        if std::mem::replace(&mut self.placed, true) {
+            winutil::set_shown(h, true);
+        }
+        if was_hidden {
+            self.signal_lost_at = None;
+            if self.settings.start_fullscreen && !window.is_fullscreen() {
+                window.toggle_fullscreen();
+            }
+        }
+        // To the front, and the keyboard (Windows is reluctant for a background app).
+        window.activate_window();
+        window.focus(&self.focus);
+        self.sync_tray();
+        self.last_move = Instant::now();
+        cx.notify();
+    }
+
+    /// Hides the window: Passthru waits in the tray, drawing and playing nothing.
+    fn hide_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(h) = self.hwnd else { return };
+        self.save_window(window);
+        self.window_shown = false;
+        self.menu_open = None;
+        self.controls_visible = false;
+        self.pill_bounds.set(None);
+        winutil::set_controls_rect(None);
+        self.video.gpu.paused.store(true, Ordering::Relaxed);
+        self.audio.muted.store(true, Ordering::Relaxed);
+        winutil::set_shown(h, false);
+        self.sync_tray();
+        cx.notify();
+    }
+
+    /// The close button, Alt+F4, a lost signal: to the tray while Passthru waits there, else
+    /// quit.
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.stays_in_tray() {
+            self.hide_window(window, cx);
+        } else {
+            self.quit(window, cx);
+        }
+    }
+
+    fn quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_window(window);
+        if let Some(h) = self.hwnd {
+            winutil::set_tray(h, false);
+        }
+        telemetry::stop();
+        cx.quit();
+    }
+
+    fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
+        self.menu_open = if self.menu_open == Some(menu) { None } else { Some(menu) };
+        cx.notify();
+    }
+
+    fn toggle_start_fullscreen(&mut self, cx: &mut Context<Self>) {
+        self.settings.start_fullscreen = !self.settings.start_fullscreen;
+        self.settings.save();
+        cx.notify();
+    }
+
+    fn toggle_open_on_signal(&mut self, cx: &mut Context<Self>) {
+        self.settings.open_on_signal = !self.settings.open_on_signal;
+        self.settings.save();
+        self.sync_tray();
+        cx.notify();
+    }
+
+    fn toggle_close_on_loss(&mut self, cx: &mut Context<Self>) {
+        self.settings.close_on_signal_loss = !self.settings.close_on_signal_loss;
+        // Counted from now, not from a loss before it was turned on.
+        self.signal_lost_at = self.signal_lost_at.map(|_| Instant::now());
+        self.settings.save();
+        cx.notify();
+    }
+
+    fn toggle_start_with_windows(&mut self, cx: &mut Context<Self>) {
+        let on = !self.settings.start_with_windows;
+        match install::set_autostart(on) {
+            Ok(()) => {
+                self.settings.start_with_windows = on;
+                self.settings.save();
+                self.sync_tray();
+            }
+            Err(e) => self.toast(format!("Can't change Start with Windows: {e:#}")),
+        }
+        cx.notify();
+    }
+
+    fn toggle_hide_from_capture(&mut self, cx: &mut Context<Self>) {
+        self.settings.hide_from_capture = !self.settings.hide_from_capture;
+        winutil::set_overlay_hidden_from_capture(self.settings.hide_from_capture);
+        self.settings.save();
+        cx.notify();
+    }
+
+    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        self.updater = update::spawn(true, true);
+        self.updater_at = Instant::now();
+        cx.notify();
     }
 
     fn set_volume(&mut self, v: f32, cx: &mut Context<Self>) {
@@ -444,7 +655,7 @@ impl Viewer {
         self.video.control.pick(mode);
         self.settings.mode = mode.map(|(w, h, f)| [w, h, f]);
         self.settings.save();
-        self.menu_open = false;
+        self.menu_open = None;
         cx.notify();
     }
 
@@ -567,78 +778,20 @@ impl Viewer {
         )
     }
 
-    /// The capture mode menu: what the device offers, and the upscaling switch.
-    fn menu(&self, max_height: Pixels, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    /// The capture mode menu: what the device offers, the colour range and upscaling.
+    fn mode_menu(&self, max_height: Pixels, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let control = &self.video.control;
         let offered = control.modes.lock().unwrap().clone();
         let wanted = *control.wanted.lock().unwrap();
-        let header = |text: SharedString| {
-            div()
-                .px(px(10.))
-                .pt(px(8.))
-                .pb(px(4.))
-                .text_size(px(10.))
-                .font_weight(FontWeight::BOLD)
-                .text_color(rgba(0xffffff66))
-                .child(text)
-        };
-        let note = |text: String| {
-            div().px(px(10.)).pb(px(6.)).text_size(px(11.)).text_color(rgba(0xffffff80)).child(text)
-        };
-        let item = |id: gpui::ElementId, label: String, detail: Option<String>, checked: bool| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .px(px(10.))
-                .py(px(6.))
-                .rounded(px(6.))
-                .cursor_pointer()
-                .hover(|s| s.bg(rgba(0xffffff1f)))
-                .child(
-                    div()
-                        .w(px(14.))
-                        .flex_none()
-                        .font_family(ICON_FONT)
-                        .text_size(px(12.))
-                        .text_color(rgb(0xffffff))
-                        .child(if checked { ICON_CHECK } else { "" }),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        // Take the row's width, so long details wrap inside the menu.
-                        .flex_1()
-                        .min_w(px(0.))
-                        .child(div().text_size(px(13.)).text_color(rgb(0xffffff)).child(label))
-                        .children(detail.map(|d| div().text_size(px(11.)).text_color(rgba(0xffffff80)).child(d))),
-                )
-        };
-        let mut menu = div()
-            .id("menu")
-            // Wide enough for the longest row of frame rates (1080p: seven) on one line.
-            .w(px(372.))
-            .max_h(max_height)
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .p(px(4.))
-            .rounded(px(10.))
-            .bg(rgba(0x121212f5))
-            .border_1()
-            .border_color(rgba(0xffffff1a))
-            .child(header("CAPTURE MODE".into()))
-            .child(
-                item(
-                    "mode-auto".into(),
-                    "Auto".into(),
-                    offered.first().map(|&(w, h, f)| format!("Best offered: {}", video::mode_label(w, h, f))),
-                    wanted.is_none(),
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.pick_mode(None, cx))),
-            );
+        let mut menu = menu_panel("mode-menu", 372., max_height).child(menu_header("CAPTURE MODE")).child(
+            menu_item(
+                "mode-auto".into(),
+                "Auto".into(),
+                offered.first().map(|&(w, h, f)| format!("Best offered: {}", video::mode_label(w, h, f))),
+                wanted.is_none(),
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.pick_mode(None, cx))),
+        );
         // One row per resolution, its frame rates as chips: 40-odd modes in about ten rows.
         for (row, ((w, h), rates)) in video::by_resolution(&offered).into_iter().enumerate() {
             let picked_here = wanted.is_some_and(|(pw, ph, _)| (pw, ph) == (w, h));
@@ -663,15 +816,7 @@ impl Viewer {
                     .gap(px(8.))
                     .px(px(10.))
                     .py(px(4.))
-                    .child(
-                        div()
-                            .w(px(14.))
-                            .flex_none()
-                            .font_family(ICON_FONT)
-                            .text_size(px(12.))
-                            .text_color(rgb(0xffffff))
-                            .child(if picked_here { ICON_CHECK } else { "" }),
-                    )
+                    .child(check_mark(picked_here))
                     .child(
                         div()
                             .w(px(72.))
@@ -684,14 +829,14 @@ impl Viewer {
             );
         }
         if let Some(m) = wanted.filter(|m| !offered.contains(m)) {
-            menu = menu.child(note(format!(
+            menu = menu.child(menu_note(format!(
                 "{} is picked but not offered right now, so Auto is used until it is.",
                 video::mode_label(m.0, m.1, m.2)
             )));
         }
         if offered.len() == 1 {
-            menu = menu.child(note(
-                "The card offers only the resolution its input sends. For another one, change the console's video output.".into(),
+            menu = menu.child(menu_note(
+                "The card offers only the resolution its input sends. For another one, change the console's video output.",
             ));
         }
         let rtx_state = match (self.settings.rtx, self.video.gpu.scaling()) {
@@ -702,11 +847,35 @@ impl Viewer {
             }
             (true, present::Scaling::NotUp) => "Used when the video is enlarged to fit".to_string(),
         };
+        let range = self.settings.range;
+        let ranges = [
+            (video::ColourRange::Auto, "Auto", control.auto_range_text()),
+            (video::ColourRange::Limited, "Limited", "16–235, the video standard".to_string()),
+            (video::ColourRange::Full, "Full", "0–255, the PS5's SDR output".to_string()),
+        ];
+        menu = menu.child(menu_rule()).child(menu_header("COLOUR RANGE"));
+        for (choice, label, detail) in ranges {
+            menu = menu.child(
+                menu_item(("range", choice as usize).into(), label.into(), Some(detail), range == choice)
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_range(choice, cx))),
+            );
+        }
+        menu.child(menu_rule()).child(menu_header("UPSCALING")).child(
+            menu_item("rtx".into(), "RTX Video Super Resolution".into(), Some(rtx_state), self.settings.rtx)
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_rtx(cx))),
+        )
+    }
+
+    /// The settings menu: how the window behaves, waiting in the background, updates.
+    fn settings_menu(&self, max_height: Pixels, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let s = &self.settings;
+        let installed = install::running_installed();
         let update_state = self.updater.state();
         let ready = match &update_state {
             update::State::Ready(v) => Some(v.clone()),
             _ => None,
         };
+        let checking = update_state == update::State::Checking;
         let update_text = match update_state {
             update::State::Off("not installed") => "Only the installed app updates itself".to_string(),
             update::State::Off(_) => "Off".to_string(),
@@ -715,41 +884,100 @@ impl Viewer {
             update::State::Ready(v) => format!("{v} downloaded: it starts next time"),
             update::State::Failed(e) => format!("Couldn't check: {}", e.chars().take(80).collect::<String>()),
         };
-        let range = self.settings.range;
-        let ranges = [
-            (video::ColourRange::Auto, "Auto", control.auto_range_text()),
-            (video::ColourRange::Limited, "Limited", "16–235, the video standard".to_string()),
-            (video::ColourRange::Full, "Full", "0–255, the PS5's SDR output".to_string()),
-        ];
-        menu = menu.child(div().h(px(1.)).mx(px(6.)).my(px(4.)).bg(rgba(0xffffff1a))).child(header("COLOUR RANGE".into()));
-        for (choice, label, detail) in ranges {
-            menu = menu.child(
-                item(("range", choice as usize).into(), label.into(), Some(detail), range == choice)
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_range(choice, cx))),
-            );
-        }
-        menu.child(div().h(px(1.)).mx(px(6.)).my(px(4.)).bg(rgba(0xffffff1a)))
-            .child(header("UPSCALING".into()))
+        let secs = CLOSE_AFTER_LOSS.as_secs();
+        let loss_text = if s.stays_in_tray() {
+            format!("After {secs} s without one, back to the tray")
+        } else {
+            format!("After {secs} s without one, Passthru quits")
+        };
+        menu_panel("settings-menu", 320., max_height)
+            .child(menu_header("WINDOW"))
             .child(
-                item("rtx".into(), "RTX Video Super Resolution".into(), Some(rtx_state), self.settings.rtx)
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_rtx(cx))),
+                menu_switch("on-top", "Always on top", Some("Above other windows (T)".into()), s.on_top, true)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_pin(cx))),
             )
-            .child(div().h(px(1.)).mx(px(6.)).my(px(4.)).bg(rgba(0xffffff1a)))
-            .child(header(format!("{} {}", app::NAME.to_uppercase(), env!("CARGO_PKG_VERSION")).into()))
             .child(
-                item("autoupdate".into(), "Update automatically".into(), Some(update_text), self.settings.auto_update)
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_auto_update(cx))),
+                menu_switch("start-fullscreen", "Open in fullscreen", None, s.start_fullscreen, true)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_start_fullscreen(cx))),
             )
+            .child(
+                menu_switch(
+                    "hide-from-capture",
+                    "Hide controls from recordings",
+                    Some("Screenshots, OBS and Discord see only the video".into()),
+                    s.hide_from_capture,
+                    true,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_hide_from_capture(cx))),
+            )
+            .child(menu_rule())
+            .child(menu_header("BACKGROUND"))
+            .child(
+                menu_switch(
+                    "open-on-signal",
+                    "Open when a signal arrives",
+                    Some("Closing the window keeps Passthru in the tray".into()),
+                    s.open_on_signal,
+                    true,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_open_on_signal(cx))),
+            )
+            .child(
+                menu_switch("close-on-loss", "Close when the signal is lost", Some(loss_text), s.close_on_signal_loss, true)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_close_on_loss(cx))),
+            )
+            .child({
+                let detail = if installed { "In the tray, ready for a signal" } else { "Only for the installed app" };
+                let row = menu_switch("start-with-windows", "Start with Windows", Some(detail.into()), s.start_with_windows, installed);
+                if installed { row.on_click(cx.listener(|this, _, _, cx| this.toggle_start_with_windows(cx))) } else { row }
+            })
+            .child(menu_rule())
+            .child(menu_header("UPDATES"))
+            .child({
+                let row = menu_switch("autoupdate", "Update automatically", Some(update_text), s.auto_update, installed);
+                if installed { row.on_click(cx.listener(|this, _, _, cx| this.toggle_auto_update(cx))) } else { row }
+            })
+            .when(installed && ready.is_none(), |d| {
+                d.child(
+                    menu_action("check-updates", if checking { "Checking…" } else { "Check for updates" }, !checking)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.updater.state() != update::State::Checking {
+                                this.check_for_updates(cx);
+                            }
+                        })),
+                )
+            })
             .children(ready.map(|v| {
-                item("restart".into(), format!("Restart now to use {v}"), None, false).on_click(cx.listener(
-                    |_, _, _, cx| {
-                        if update::restart().is_ok() {
-                            telemetry::stop();
-                            cx.quit();
-                        }
-                    },
-                ))
+                menu_action("restart", &format!("Restart now to use {v}"), true).on_click(cx.listener(|this, _, _, _| {
+                    if update::restart().is_ok() {
+                        this.request(winutil::Event::Quit);
+                    }
+                }))
             }))
+            .child(
+                div()
+                    .px(px(10.))
+                    .pt(px(6.))
+                    .pb(px(4.))
+                    .text_size(px(10.))
+                    .text_color(rgba(0xffffff4d))
+                    .child(format!("{} {}", app::NAME, env!("CARGO_PKG_VERSION"))),
+            )
+    }
+
+    fn scroll_volume(&mut self, e: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let dy = e.delta.pixel_delta(px(20.)).y;
+        if dy != px(0.) {
+            let step = if dy > px(0.) { 0.05 } else { -0.05 };
+            self.set_volume(self.settings.volume + step, cx);
+            self.settings.save();
+            self.last_move = Instant::now();
+        }
+    }
+
+    /// Asks for something done to the main window (the controls are in another one).
+    fn request(&self, e: winutil::Event) {
+        let _ = self.requests.unbounded_send(e);
     }
 
     fn volume_from_x(&mut self, x: Pixels, cx: &mut Context<Self>) {
@@ -769,6 +997,107 @@ impl Viewer {
         ]);
         self.settings.save();
     }
+}
+
+/// A menu: dark, rounded, scrolling once it's taller than `max_height`.
+fn menu_panel(id: &'static str, width: f32, max_height: Pixels) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .w(px(width))
+        .max_h(max_height)
+        .overflow_y_scroll()
+        .flex()
+        .flex_col()
+        .p(px(4.))
+        .rounded(px(10.))
+        .bg(rgba(0x121212f5))
+        .border_1()
+        .border_color(rgba(0xffffff1a))
+}
+
+fn menu_header(text: impl Into<SharedString>) -> gpui::Div {
+    div()
+        .px(px(10.))
+        .pt(px(8.))
+        .pb(px(4.))
+        .text_size(px(10.))
+        .font_weight(FontWeight::BOLD)
+        .text_color(rgba(0xffffff66))
+        .child(text.into())
+}
+
+fn menu_note(text: impl Into<SharedString>) -> gpui::Div {
+    div().px(px(10.)).pb(px(6.)).text_size(px(11.)).text_color(rgba(0xffffff80)).child(text.into())
+}
+
+fn menu_rule() -> gpui::Div {
+    div().h(px(1.)).mx(px(6.)).my(px(4.)).bg(rgba(0xffffff1a))
+}
+
+fn check_mark(checked: bool) -> gpui::Div {
+    div()
+        .w(px(14.))
+        .flex_none()
+        .font_family(ICON_FONT)
+        .text_size(px(12.))
+        .text_color(rgb(0xffffff))
+        .child(if checked { ICON_CHECK } else { "" })
+}
+
+/// A row's label, and a line under it in grey; it takes the row's width, so long details wrap.
+fn menu_label(label: impl Into<SharedString>, detail: Option<String>) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w(px(0.))
+        .child(div().text_size(px(13.)).text_color(rgb(0xffffff)).child(label.into()))
+        .children(detail.map(|d| div().text_size(px(11.)).text_color(rgba(0xffffff80)).child(d)))
+}
+
+fn menu_row(id: impl Into<gpui::ElementId>, enabled: bool) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id.into())
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .px(px(10.))
+        .py(px(6.))
+        .rounded(px(6.))
+        .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(rgba(0xffffff1f))))
+        .when(!enabled, |d| d.opacity(0.4))
+}
+
+/// One choice of several, ticked when it's the one picked.
+fn menu_item(id: gpui::ElementId, label: String, detail: Option<String>, checked: bool) -> gpui::Stateful<gpui::Div> {
+    menu_row(id, true).child(check_mark(checked)).child(menu_label(label, detail))
+}
+
+/// A setting that's on or off: its label, and a switch at the right.
+fn menu_switch(id: &'static str, label: &'static str, detail: Option<String>, on: bool, enabled: bool) -> gpui::Stateful<gpui::Div> {
+    let switch = div()
+        .relative()
+        .w(px(28.))
+        .h(px(16.))
+        .flex_none()
+        .rounded_full()
+        .when(on, |d| d.bg(rgb(0xffffff)))
+        .when(!on, |d| d.bg(rgba(0xffffff2e)))
+        .child(
+            div()
+                .absolute()
+                .top(px(2.))
+                .left(px(if on { 14. } else { 2. }))
+                .size(px(12.))
+                .rounded_full()
+                .bg(if on { rgb(0x121212) } else { rgb(0xffffff) }),
+        );
+    menu_row(id, enabled).gap(px(12.)).child(menu_label(label, detail)).child(switch)
+}
+
+/// Something to do (check for updates), lined up with the labels above it.
+fn menu_action(id: &'static str, label: &str, enabled: bool) -> gpui::Stateful<gpui::Div> {
+    menu_row(id, enabled).child(div().text_size(px(13.)).text_color(rgb(0xffffff)).child(label.to_string()))
 }
 
 fn icon_button(id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::Div> {
@@ -822,88 +1151,15 @@ fn divider() -> gpui::Div {
     div().w(px(1.)).h(px(18.)).mx(px(4.)).flex_none().bg(rgba(0xffffff33))
 }
 
-impl Render for Viewer {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Swap in the newest frame and free the previous one's GPU texture.
-        if let Some((frame, ready_at)) = self.video.latest.lock().unwrap().take() {
-            let now = Instant::now();
-            self.video.meter.shown(now, false, Some(ready_at));
-            self.stats.window.record(ready_at, now);
-            if let Some(total) = &mut self.stats.total {
-                total.record(ready_at, now);
-            }
-            if let Some(old) = self.shown.replace(frame) {
-                let _ = window.drop_image(old);
-            }
-        }
-        self.video.pending.store(false, Ordering::Release);
-        // Once the GPU layer under this one draws the video, this layer stays transparent
-        // except for the controls.
-        let gpu = self.video.gpu.ready.load(Ordering::Acquire);
-        self.gpu_drawing = gpu;
-        if gpu && let Some(old) = self.shown.take() {
-            let _ = window.drop_image(old);
-        }
-
-        let aspect = f32::from_bits(self.video.aspect.load(Ordering::Relaxed));
-        if aspect != self.aspect {
-            self.aspect = aspect;
-            winutil::set_aspect(aspect);
-        }
-
-        // Fit the video ourselves, snapped to whole device pixels: a fractional position would
-        // blur every pixel, and at 1440p in fullscreen it lands exactly 1:1 on the screen.
-        let scale = window.scale_factor();
+impl Viewer {
+    /// The controls, their menus and the messages top right. They're drawn in a window of their
+    /// own over the video's (see winutil's overlay), which recordings can be kept from seeing.
+    fn render_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let viewport = window.viewport_size();
-        let (vw, vh) = (f32::from(viewport.width) * scale, f32::from(viewport.height) * scale);
-        let (fit_w, fit_h) = if vw / vh > aspect {
-            ((vh * aspect).round(), vh.round())
-        } else {
-            (vw.round(), (vw / aspect).round())
-        };
-        let (fit_x, fit_y) = (((vw - fit_w) / 2.0).floor(), ((vh - fit_h) / 2.0).floor());
-        self.video.display_w.store(fit_w as u32, Ordering::Relaxed);
-        let logical = |v: f32| px(v / scale);
-
-        let signal = self.has_signal();
-        self.had_signal = signal;
-        let fullscreen = window.is_fullscreen();
+        let fullscreen = self.fullscreen;
         let muted = self.settings.muted;
         let volume = self.settings.volume;
         let hdr = self.settings.hdr;
-
-        let video = div()
-            .id("video")
-            .absolute()
-            .size_full()
-            .when_some(self.shown.clone().filter(|_| signal && !gpu), |d, frame| {
-                d.child(
-                    img(ImageSource::Render(frame))
-                        .absolute()
-                        .left(logical(fit_x))
-                        .top(logical(fit_y))
-                        .w(logical(fit_w))
-                        .h(logical(fit_h))
-                        .object_fit(ObjectFit::Fill),
-                )
-            })
-            .when(!signal, |d| {
-                let status = {
-                    let v = self.video.status.lock().unwrap().clone();
-                    if self.video.last_frame.lock().unwrap().is_some() || v.is_empty() {
-                        "No signal".to_string()
-                    } else {
-                        v
-                    }
-                };
-                d.flex().items_center().justify_center().child(
-                    div()
-                        .text_color(rgba(0xffffff66))
-                        .text_size(px(14.))
-                        .child(SharedString::from(status)),
-                )
-            });
-
         let slider_bounds = self.slider_bounds.clone();
         let pill_bounds = self.pill_bounds.clone();
         let fill: Hsla = if muted { rgba(0xffffff55).into() } else { rgb(0xffffff).into() };
@@ -973,17 +1229,14 @@ impl Render for Viewer {
         };
         let overlay_button = chip("fps", "FPS", overlay_value.to_string(), overlay_mode != Overlay::Off, 88.)
             .on_click(cx.listener(|this, _, _, cx| this.cycle_overlay(cx)));
-        // Inside the video's top-left corner (clear of black bars).
-        let overlay = (signal && overlay_mode != Overlay::Off).then(|| {
-            overlay::panel(overlay_mode, &self.numbers, self.graphs.as_ref())
-                .absolute()
-                .left(logical(fit_x) + px(12.))
-                .top(logical(fit_y) + px(12.))
-        });
 
         // Room above the controls, so the menu never runs off the top (it scrolls instead).
         let menu_room = (viewport.height - px(90.)).max(px(160.));
-        let menu = self.menu_open.then(|| self.menu(menu_room, cx));
+        let menu = match self.menu_open {
+            Some(Menu::Mode) => Some(self.mode_menu(menu_room, cx)),
+            Some(Menu::Settings) => Some(self.settings_menu(menu_room, cx)),
+            None => None,
+        };
         // Slide in from below the window and back out, on a spring; settled, no more frames.
         let target = if self.controls_visible { 0.0 } else { 1.0 };
         let now = Instant::now();
@@ -1016,8 +1269,7 @@ impl Render for Viewer {
                     .items_center()
                     .gap(px(8.))
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                        if this.menu_open {
-                            this.menu_open = false;
+                        if this.menu_open.take().is_some() {
                             cx.notify();
                         }
                     }))
@@ -1072,41 +1324,133 @@ impl Render for Viewer {
                             .text_size(px(12.))
                             .text_color(rgba(0xffffffb3))
                             .hover(|s| s.bg(rgba(0xffffff26)))
-                            .when(self.menu_open, |d| d.bg(rgba(0xffffff26)))
+                            .when(self.menu_open == Some(Menu::Mode), |d| d.bg(rgba(0xffffff26)))
                             .child(if mode.is_empty() { "Mode".to_string() } else { mode })
                             .child(div().flex_none().font_family(ICON_FONT).text_size(px(9.)).child(ICON_CHEVRON_UP))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.menu_open = !this.menu_open;
-                                cx.notify();
-                            })),
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(Menu::Mode, cx))),
                     )
                     .child(divider())
                     .child(
-                        icon_button("pin", ICON_PIN)
-                            // Pinned: the solid head under the outline, which keeps the needle.
-                            .when(self.settings.on_top, |d| {
-                                d.relative().bg(rgba(0xffffff26)).child(
-                                    div()
-                                        .absolute()
-                                        .inset_0()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(ICON_PINNED),
-                                )
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_pin(cx))),
+                        icon_button("settings", ICON_SETTINGS)
+                            .when(self.menu_open == Some(Menu::Settings), |d| d.bg(rgba(0xffffff26)))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(Menu::Settings, cx))),
                     )
                     .child(
                         icon_button("fullscreen", if fullscreen { ICON_EXIT_FULLSCREEN } else { ICON_FULLSCREEN })
-                            .on_click(|_, window, _| window.toggle_fullscreen()),
+                            .on_click(cx.listener(|this, _, _, _| this.request(winutil::Event::ToggleFullscreen))),
                     )
-                    .child(icon_button("close", ICON_CLOSE).on_click(cx.listener(|this, _, window, cx| {
-                        this.save_window(window);
-                        cx.quit();
-                    }))),
+                    .child(
+                        icon_button("close", ICON_CLOSE)
+                            .on_click(cx.listener(|this, _, _, _| this.request(winutil::Event::Close))),
+                    ),
                     ),
             );
+
+
+        let badges = self.badges();
+        let drawn = self.controls_visible || slide < 0.999;
+        self.controls_drawn = drawn || badges.is_some();
+        div()
+            .id("controls-root")
+            .relative()
+            .size_full()
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
+                if this.dragging_volume {
+                    this.volume_from_x(e.position.x, cx);
+                }
+            }))
+            .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, _, cx| this.scroll_volume(e, cx)))
+            .children(badges)
+            .when(drawn, |d| d.child(controls))
+    }
+}
+
+impl Render for Viewer {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Swap in the newest frame and free the previous one's GPU texture.
+        if let Some((frame, ready_at)) = self.video.latest.lock().unwrap().take() {
+            let now = Instant::now();
+            self.video.meter.shown(now, false, Some(ready_at));
+            self.stats.window.record(ready_at, now);
+            if let Some(total) = &mut self.stats.total {
+                total.record(ready_at, now);
+            }
+            if let Some(old) = self.shown.replace(frame) {
+                let _ = window.drop_image(old);
+            }
+        }
+        self.video.pending.store(false, Ordering::Release);
+        // Once the GPU layer under this one draws the video, this layer stays transparent
+        // except for the controls.
+        let gpu = self.video.gpu.ready.load(Ordering::Acquire);
+        self.gpu_drawing = gpu;
+        if gpu && let Some(old) = self.shown.take() {
+            let _ = window.drop_image(old);
+        }
+
+        let aspect = f32::from_bits(self.video.aspect.load(Ordering::Relaxed));
+        if aspect != self.aspect {
+            self.aspect = aspect;
+            winutil::set_aspect(aspect);
+        }
+
+        // Fit the video ourselves, snapped to whole device pixels: a fractional position would
+        // blur every pixel, and at 1440p in fullscreen it lands exactly 1:1 on the screen.
+        let scale = window.scale_factor();
+        let viewport = window.viewport_size();
+        let (vw, vh) = (f32::from(viewport.width) * scale, f32::from(viewport.height) * scale);
+        let (fit_w, fit_h) = if vw / vh > aspect {
+            ((vh * aspect).round(), vh.round())
+        } else {
+            (vw.round(), (vw / aspect).round())
+        };
+        let (fit_x, fit_y) = (((vw - fit_w) / 2.0).floor(), ((vh - fit_h) / 2.0).floor());
+        self.video.display_w.store(fit_w as u32, Ordering::Relaxed);
+        let logical = |v: f32| px(v / scale);
+
+        let signal = self.has_signal();
+        self.had_signal = signal;
+
+        let video = div()
+            .id("video")
+            .absolute()
+            .size_full()
+            .when_some(self.shown.clone().filter(|_| signal && !gpu), |d, frame| {
+                d.child(
+                    img(ImageSource::Render(frame))
+                        .absolute()
+                        .left(logical(fit_x))
+                        .top(logical(fit_y))
+                        .w(logical(fit_w))
+                        .h(logical(fit_h))
+                        .object_fit(ObjectFit::Fill),
+                )
+            })
+            .when(!signal, |d| {
+                let status = {
+                    let v = self.video.status.lock().unwrap().clone();
+                    if self.video.last_frame.lock().unwrap().is_some() || v.is_empty() {
+                        "No signal".to_string()
+                    } else {
+                        v
+                    }
+                };
+                d.flex().items_center().justify_center().child(
+                    div()
+                        .text_color(rgba(0xffffff66))
+                        .text_size(px(14.))
+                        .child(SharedString::from(status)),
+                )
+            });
+
+        let overlay_mode = self.settings.overlay;
+        // Inside the video's top-left corner (clear of black bars).
+        let overlay = (signal && overlay_mode != Overlay::Off).then(|| {
+            overlay::panel(overlay_mode, &self.numbers, self.graphs.as_ref())
+                .absolute()
+                .left(logical(fit_x) + px(12.))
+                .top(logical(fit_y) + px(12.))
+        });
 
         div()
             .id("root")
@@ -1127,20 +1471,20 @@ impl Render for Viewer {
                     }
                 }),
             )
-            .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, _, cx| {
-                let dy = e.delta.pixel_delta(px(20.)).y;
-                if dy != px(0.) {
-                    let step = if dy > px(0.) { 0.05 } else { -0.05 };
-                    this.set_volume(this.settings.volume + step, cx);
-                    this.settings.save();
-                    this.last_move = Instant::now();
-                }
-            }))
+            .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, _, cx| this.scroll_volume(e, cx)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.menu_open.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
                 match e.keystroke.key.as_str() {
                     "f" | "f11" | "enter" => window.toggle_fullscreen(),
-                    "escape" if this.menu_open => {
-                        this.menu_open = false;
+                    "escape" if this.menu_open.is_some() => {
+                        this.menu_open = None;
                         cx.notify();
                     }
                     "escape" if window.is_fullscreen() => window.toggle_fullscreen(),
@@ -1166,8 +1510,38 @@ impl Render for Viewer {
             }))
             .child(video)
             .children(overlay)
-            .children(self.badges())
-            .when(self.controls_visible || slide < 0.999, |d| d.child(controls))
+    }
+}
+
+/// Opens the controls' window: transparent, borderless, never activated, owned by the main
+/// window and kept on its client area (winutil does that, and the clicks: only those on the
+/// controls stay here, the rest go through to the video).
+fn open_controls_window(viewer: gpui::Entity<Viewer>, in_capture: bool, cx: &mut App) {
+    let (main, hide) = {
+        let v = viewer.read(cx);
+        (v.hwnd, v.settings.hide_from_capture && !in_capture)
+    };
+    let Some(main) = main else { return };
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(point(px(0.), px(0.)), size(px(64.), px(64.))))),
+        titlebar: None,
+        focus: false,
+        show: false,
+        kind: gpui::WindowKind::PopUp,
+        is_movable: false,
+        is_resizable: false,
+        is_minimizable: false,
+        window_background: WindowBackgroundAppearance::Transparent,
+        ..Default::default()
+    };
+    // Taken over only once gpui has set the window up: sizing it before then is lost.
+    let opened = cx
+        .open_window(options, |_, cx| cx.new(|cx| ControlsView::new(viewer, cx)))
+        .and_then(|w| w.update(cx, |_, window, _| winutil::hwnd(window)));
+    match opened {
+        Ok(Some(h)) => winutil::install_overlay(h, main, hide),
+        Ok(None) => {}
+        Err(e) => log::line(&format!("controls window: {e:#}")),
     }
 }
 
@@ -1222,6 +1596,14 @@ struct Args {
     capture: Option<(Duration, std::path::PathBuf)>,
     /// Debug: keep the controls up with the mode menu open (for screenshots).
     show_menu: bool,
+    /// Debug: the same with the settings menu open.
+    show_settings: bool,
+    /// Debug: screenshots and recordings see the controls, this run (for screenshots of them).
+    controls_in_capture: bool,
+    /// Start hidden, in the tray (how Start with Windows starts it).
+    background: bool,
+    /// Started by a Passthru that's exiting (an update): wait for it rather than defer to it.
+    restarted: bool,
     /// Start a test session as soon as the video is up.
     record: bool,
     record_opts: telemetry::Options,
@@ -1242,6 +1624,10 @@ fn parse_args() -> Args {
         cpu: false,
         capture: None,
         show_menu: false,
+        show_settings: false,
+        controls_in_capture: false,
+        background: false,
+        restarted: false,
         record: false,
         record_opts: telemetry::Options::default(),
     };
@@ -1256,6 +1642,10 @@ fn parse_args() -> Args {
             "--fps" => a.overlay = args.next().and_then(|m| serde_json::from_value(serde_json::Value::String(m)).ok()),
             "--cpu" => a.cpu = true,
             "--show-menu" => a.show_menu = true,
+            "--show-settings" => a.show_settings = true,
+            "--controls-in-capture" => a.controls_in_capture = true,
+            "--background" => a.background = true,
+            "--restarted" => a.restarted = true,
             // Test sessions (see telemetry.rs); R toggles one in the app too.
             // Developer mode (test sessions, R and B); `--record` implies it.
             "--dev" => {}
@@ -1407,12 +1797,22 @@ fn main() {
     if argv.len() == 1 && !cfg!(debug_assertions) && !dev_build && install::offer() {
         return;
     }
+    // One at a time: if one's already running (in the tray, say), bring that one up instead.
+    if !cfg!(debug_assertions) && !dev_build {
+        let wait = if args.restarted { Duration::from_secs(10) } else { Duration::ZERO };
+        if !instance::claim(wait) && (args.background || instance::show_running() || !instance::claim(Duration::from_secs(3))) {
+            return;
+        }
+    }
     log::start();
     if install::running_installed() {
         update::clean_up();
         install::refresh_registration();
     }
     let mut settings = Settings::load();
+    if install::running_installed() && settings.start_with_windows {
+        let _ = install::set_autostart(true);
+    }
     if let Some(s) = args.smooth {
         settings.smooth_for_run(s);
     }
@@ -1446,7 +1846,10 @@ fn main() {
     audio::spawn(audio.clone(), args.audio);
     let (stats_enabled, exit_after, start_fullscreen) = (args.stats, args.exit_after, args.fullscreen);
     let (force_on_top, cpu_only, capture) = (args.on_top, args.cpu, args.capture.clone());
-    let show_menu = args.show_menu;
+    let (show_menu, show_settings) = (args.show_menu, args.show_settings);
+    let start_hidden = args.background;
+    let controls_in_capture = args.controls_in_capture;
+    let start_fullscreen = (start_fullscreen || settings.start_fullscreen) && !start_hidden;
     let (record_now, record_opts) = (args.record, args.record_opts.clone());
 
     Application::new().run(move |cx: &mut App| {
@@ -1468,11 +1871,14 @@ fn main() {
             window_min_size: Some(size(px(320.), px(180.))),
             window_background: WindowBackgroundAppearance::Opaque,
             app_id: Some("passthru".into()),
+            show: !start_hidden,
+            focus: !start_hidden,
             ..Default::default()
         };
-        cx.open_window(options, |window, cx| {
+        let main_window = cx.open_window(options, |window, cx| {
             let hwnd = winutil::hwnd(window);
             let (events_tx, mut events) = futures::channel::mpsc::unbounded();
+            let requests = events_tx.clone();
             if let Some(h) = hwnd {
                 winutil::install(h, events_tx);
                 if settings.on_top || force_on_top {
@@ -1496,13 +1902,16 @@ fn main() {
                 // Requests from the window procedure wrapper.
                 cx.spawn_in(window, async move |this, cx| {
                     while let Some(event) = events.next().await {
-                        let ok = this.update_in(cx, |this: &mut Viewer, _, cx| match event {
+                        let ok = this.update_in(cx, |this: &mut Viewer, window, cx| match event {
                             winutil::Event::PressOutside => {
-                                if this.menu_open {
-                                    this.menu_open = false;
+                                if this.menu_open.take().is_some() {
                                     cx.notify();
                                 }
                             }
+                            winutil::Event::Open => this.show_window(window, cx),
+                            winutil::Event::Quit => this.quit(window, cx),
+                            winutil::Event::Close => this.close(window, cx),
+                            winutil::Event::ToggleFullscreen => window.toggle_fullscreen(),
                         });
                         if ok.is_err() {
                             break;
@@ -1563,25 +1972,60 @@ fn main() {
                     controls_visible: false,
                     cursor_hidden: false,
                     dragging_volume: false,
-                    menu_open: show_menu,
-                    show_menu,
+                    menu_open: if show_settings {
+                        Some(Menu::Settings)
+                    } else {
+                        show_menu.then_some(Menu::Mode)
+                    },
+                    show_menu: show_menu || show_settings,
+                    updater_at: Instant::now(),
+                    window_shown: !start_hidden,
+                    placed: !start_hidden,
+                    signal_on: false,
+                    signal_lost_at: None,
+                    fullscreen: false,
+                    controls_drawn: false,
+                    requests,
                     controls_state: None,
                     pill_bounds: Rc::new(Cell::new(None)),
                     slider_bounds: Rc::new(Cell::new(None)),
                 }
             });
-            // Alt+F4 and friends: remember where the window was.
+            view.update(cx, |v, _| {
+                if start_hidden {
+                    v.video.gpu.paused.store(true, Ordering::Relaxed);
+                    v.audio.muted.store(true, Ordering::Relaxed);
+                }
+                v.sync_tray();
+            });
+            // Alt+F4 and friends: to the tray while Passthru waits there, else remember where
+            // the window was and quit.
             let weak = view.downgrade();
             window.on_window_should_close(cx, move |window, cx| {
-                let _ = weak.update(cx, |v, _| v.save_window(window));
-                telemetry::stop();
-                true
+                weak.update(cx, |v, cx| {
+                    if v.settings.stays_in_tray() {
+                        v.hide_window(window, cx);
+                        return false;
+                    }
+                    v.save_window(window);
+                    if let Some(h) = v.hwnd {
+                        winutil::set_tray(h, false);
+                    }
+                    telemetry::stop();
+                    true
+                })
+                .unwrap_or(true)
             });
             view
         })
         .expect("open window");
+        if let Ok(viewer) = main_window.update(cx, |_, _, cx| cx.entity()) {
+            open_controls_window(viewer, controls_in_capture, cx);
+        }
         cx.on_window_closed(|cx| cx.quit()).detach();
-        cx.activate(true);
+        if !start_hidden {
+            cx.activate(true);
+        }
     });
     telemetry::stop();
 }
