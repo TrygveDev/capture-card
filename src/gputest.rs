@@ -149,11 +149,11 @@ pub fn upscale_test(src: &Path, out_dir: &Path, scale: f64) -> Result<()> {
     let iters = 60;
     let (target, rtv) = gpu.target(w, h, DXGI_FORMAT_R8G8B8A8_UNORM)?;
     let rect = [0.0, 0.0, w as f32, h as f32];
-    gpu.draw(&rtv, (w, h), Some(input), rect);
+    gpu.draw(&rtv, (w, h), Some(input), rect, None);
     gpu.wait_idle()?;
     let t = Instant::now();
     for _ in 0..iters {
-        gpu.draw(&rtv, (w, h), Some(input), rect);
+        gpu.draw(&rtv, (w, h), Some(input), rect, None);
     }
     gpu.wait_idle()?;
     report("lanczos", &read(&target)?, t.elapsed().as_secs_f64() * 1000.0 / iters as f64)?;
@@ -653,5 +653,36 @@ pub fn decode_test(raw: &Path, w: usize, h: usize) -> Result<()> {
             sum as f64 / (w * h * 3) as f64,
         );
     }
+    Ok(())
+}
+
+/// `--mark-test IMAGE OUTDIR`: draws IMAGE through the present shader with test sessions'
+/// barcode for a set of present numbers, and saves each frame (`mark_NNNN.png`) and the
+/// numbers (`marks.txt`), for checking the analyzer reads them back (also after encoding).
+pub fn mark_test(src: &Path, out_dir: &Path) -> Result<()> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+    let img = image::open(src).with_context(|| format!("open {}", src.display()))?.to_rgba8();
+    let (w, h) = (img.width() & !1, img.height() & !1);
+    std::fs::create_dir_all(out_dir)?;
+    let gpu = Gpu::new()?;
+    let f = Frames::new(&gpu, w, h, Layout::Rgb32)?;
+    let bgra: Vec<u8> = img.pixels().flat_map(|p| [p[2], p[1], p[0], 255]).collect();
+    let bgra: Vec<u8> = bgra.chunks_exact(img.width() as usize * 4).take(h as usize).flat_map(|r| &r[..w as usize * 4]).copied().collect();
+    f.upload(&gpu, &bgra)?;
+    f.decode(&gpu, 0, &RGB, false);
+    let (target, rtv) = gpu.target(w, h, DXGI_FORMAT_R8G8B8A8_UNORM)?;
+    let rect = [0.0, 0.0, w as f32, h as f32];
+    // Edge cases, then a run of consecutive numbers wrapping past 16 bits.
+    let mut codes: Vec<u32> = vec![0, 1, 2, 0x5555, 0xAAAA, 0xFFFF, 0x8000, 12345];
+    codes.extend((0..40).map(|i| (65_520 + i) & 0xFFFF));
+    let mut list = String::new();
+    for (i, &code) in codes.iter().enumerate() {
+        gpu.draw(&rtv, (w, h), Some(&f.slots[0].frame), rect, Some(code));
+        let px = rgb_of(&gpu.read(&target, 4)?);
+        save(&out_dir.join(format!("mark_{i:04}.png")), &px, w as usize, (0, 0, w as usize, h as usize))?;
+        list += &format!("{code}\n");
+    }
+    std::fs::write(out_dir.join("marks.txt"), list)?;
+    println!("{} marked frames of {w}x{h} in {}", codes.len(), out_dir.display());
     Ok(())
 }

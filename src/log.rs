@@ -33,6 +33,7 @@ pub fn start() {
 
 pub fn line(msg: &str) {
     eprintln!("{msg}");
+    crate::telemetry::note("log", || msg.to_string());
     let mut file = FILE.lock().unwrap();
     if let Some((f, written)) = file.as_mut()
         && *written < MAX_BYTES

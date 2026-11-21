@@ -25,6 +25,7 @@ use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerforma
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 use crate::gpu::{Decoding, Frames, Gpu, Swap};
+use crate::telemetry::{self, Ev, FrameKind};
 use crate::upscale::Upscaler;
 use crate::video::VideoShared;
 
@@ -47,6 +48,39 @@ pub struct RawFrame {
     pub h: u32,
     pub decode: Decoding,
     pub at: Instant,
+    /// The card frame's number (test sessions match it to `capture.csv`).
+    pub seq: u64,
+    /// Time spent copying it out of the capture buffer.
+    pub copy_us: u32,
+    /// The capture mode's frame rate.
+    pub fps: f32,
+}
+
+/// A card frame without its pixels, kept with them until the presenter is done (test
+/// sessions record it then).
+#[derive(Clone, Copy)]
+struct RawInfo {
+    seq: u64,
+    at: Instant,
+    copy_us: u32,
+    w: u32,
+    h: u32,
+    layout: crate::video::Layout,
+    fps: f32,
+}
+
+impl RawFrame {
+    fn info(&self) -> RawInfo {
+        RawInfo {
+            seq: self.seq,
+            at: self.at,
+            copy_us: self.copy_us,
+            w: self.w,
+            h: self.h,
+            layout: self.decode.layout,
+            fps: self.fps,
+        }
+    }
 }
 
 /// State shared with the capture thread and the UI.
@@ -123,8 +157,10 @@ pub struct Presenter {
 pub struct Spare(Arc<Mutex<Vec<Vec<u8>>>>);
 
 impl Spare {
-    /// Enough for the frame in flight, the one kept for comparison and one to swap.
-    const KEEP: usize = 3;
+    /// Enough for the frame in flight, the one kept for comparison and one to swap, and for
+    /// the frames queued for a test session's input video. Only as many as were ever in use
+    /// at once are kept, so without recording it stays at three or four.
+    const KEEP: usize = 12;
 
     pub fn take(&self) -> Vec<u8> {
         self.0.lock().unwrap().pop().unwrap_or_default()
@@ -138,8 +174,25 @@ impl Spare {
     }
 }
 
+/// The shared state, for test sessions' system samples.
+static SHARED: OnceLock<Arc<VideoShared>> = OnceLock::new();
+
+/// The display's refresh rate, once the presenter knows it.
+pub fn display_hz() -> Option<u32> {
+    let hz = SHARED.get()?.gpu.refresh_hz.load(Ordering::Relaxed);
+    (hz > 0).then_some(hz)
+}
+
+/// Display rate, smoothing target and detected game rate, for test sessions.
+pub fn shared_numbers() -> (u32, u32, f32) {
+    SHARED.get().map_or((0, 0, 0.0), |s| {
+        (s.gpu.refresh_hz.load(Ordering::Relaxed), s.gpu.target.load(Ordering::Relaxed), s.gpu.content_fps())
+    })
+}
+
 impl Presenter {
     pub fn spawn(shared: Arc<VideoShared>) -> Presenter {
+        let _ = SHARED.set(shared.clone());
         let (tx, rx) = mpsc::channel();
         let spare = Spare::default();
         let theirs = spare.clone();
@@ -266,6 +319,13 @@ struct Entry {
     arrived: Option<Instant>,
 }
 
+/// What the next present is, for test sessions (`Video::draw` records it).
+#[derive(Clone, Copy, Default)]
+struct PresentMeta {
+    due: Option<Instant>,
+    arrived: Option<Instant>,
+}
+
 /// Rate and pacing counters for one stretch of time.
 #[derive(Clone)]
 struct Window {
@@ -348,7 +408,7 @@ struct Video<'a> {
     /// Next generated-frame texture to use.
     next_out: usize,
     queue: VecDeque<Entry>,
-    last_raw: Option<Vec<u8>>,
+    last_raw: Option<(Vec<u8>, RawInfo)>,
     spare: Spare,
     last_decode: Option<Decoding>,
     last_at: Option<Instant>,
@@ -359,8 +419,14 @@ struct Video<'a> {
     window: Window,
     total: Option<Window>,
     started: Instant,
-    /// The last pair's GPU work: a fence after it and when it was submitted.
-    pending: Option<(windows::Win32::Graphics::Direct3D11::ID3D11Query, Instant)>,
+    /// The last pair's GPU work: a fence after it, when it was submitted, and its picture.
+    pending: Option<(windows::Win32::Graphics::Direct3D11::ID3D11Query, Instant, u64)>,
+    /// Test sessions: presents so far, the card frame in each slot, the picture and time of
+    /// each generated frame, and what the next present is.
+    presents: u64,
+    slot_seq: [u64; 2],
+    out_meta: [(u64, f32); crate::gpu::OUTS],
+    meta: PresentMeta,
     /// How long a pair's GPU work takes (smoothed).
     gpu_time: Duration,
     /// Slots of the pair the motion field is for, while it has frames still to generate.
@@ -439,6 +505,10 @@ fn run(shared: &VideoShared, rx: Receiver<RawFrame>, spare: Spare) -> Result<()>
         total: None,
         started: Instant::now(),
         pending: None,
+        presents: 0,
+        slot_seq: [0; 2],
+        out_meta: [(0, 0.0); crate::gpu::OUTS],
+        meta: PresentMeta::default(),
         gpu_time: GPU_GUESS,
         pair: None,
         refresh: None,
@@ -486,6 +556,7 @@ fn run(shared: &VideoShared, rx: Receiver<RawFrame>, spare: Spare) -> Result<()>
         if now >= front.at {
             v.generate(1);
             let e = v.queue.pop_front().expect("non-empty");
+            v.meta.due = Some(e.at);
             v.show(e.what, e.arrived)?;
             // The next one now, a step ahead of its time.
             v.generate(1);
@@ -527,13 +598,49 @@ impl Video<'_> {
         }
         self.shared.gpu.scaling.store(scaling as u8, Ordering::Relaxed);
         let shown = if scaling == Scaling::Rtx { self.upscaler.as_ref().and_then(|u| u.output()) } else { src };
-        self.swap.show(&self.gpu, shown, rect)?;
-        self.showing = if src.is_some() { what } else { Showing::Black };
+        let has_src = src.is_some();
+        self.presents += 1;
+        let mark = telemetry::marks().then_some((self.presents & 0xFFFF) as u32);
+        let call = Instant::now();
+        self.swap.show(&self.gpu, shown, rect, mark)?;
+        let meta = std::mem::take(&mut self.meta);
+        if telemetry::on() {
+            self.record_present(what, has_src, meta, call);
+        }
+        self.showing = if has_src { what } else { Showing::Black };
         Ok(())
+    }
+
+    /// Test sessions: the present just made, and the latest present DXGI says reached the
+    /// screen (and at which vblank).
+    fn record_present(&self, what: Showing, has_src: bool, meta: PresentMeta, call: Instant) {
+        let done = Instant::now();
+        let (kind, seq, t) = match what {
+            _ if !has_src => (0, 0, 0.0),
+            Showing::Slot(i) => (1, self.slot_seq[i], 1.0),
+            Showing::Generated(i) | Showing::Pending(i, _) => (2, self.out_meta[i].0, self.out_meta[i].1),
+            Showing::Black => (0, 0, 0.0),
+        };
+        telemetry::emit(Ev::Present(telemetry::PresentRec {
+            n: self.presents,
+            swap_count: self.swap.present_count(),
+            kind,
+            seq,
+            t,
+            due: meta.due,
+            call,
+            done,
+            arrived: meta.arrived,
+            queued: self.queue.len() as u32,
+        }));
+        if let Some((present_count, refresh, sync_refresh, sync_qpc)) = self.swap.frame_stats() {
+            telemetry::emit(Ev::Displayed { present_count, refresh, sync_refresh, sync_qpc });
+        }
     }
 
     /// Presents and counts it.
     fn show(&mut self, what: Showing, arrived: Option<Instant>) -> Result<()> {
+        self.meta.arrived = arrived;
         self.draw(Some(what))?;
         let now = Instant::now();
         let generated = matches!(what, Showing::Generated(_) | Showing::Pending(..));
@@ -577,6 +684,7 @@ impl Video<'_> {
             self.aspect = aspect;
             self.swap.ensure(&self.gpu, client.0, client.1)?;
             if lost {
+                telemetry::note("signal_lost", || "no frame for a second: showing black".into());
                 self.queue.clear();
                 self.key = None;
                 self.draw(Some(Showing::Black))?;
@@ -654,23 +762,57 @@ impl Video<'_> {
 
     /// Picks up how long the last pair's GPU work took.
     fn measure(&mut self) {
-        let Some((fence, at)) = &self.pending else {
+        if telemetry::on()
+            && let Some(f) = self.frames.as_mut()
+        {
+            for (seq, counts) in f.poll_counts(&self.gpu) {
+                telemetry::emit(Ev::PairCounts { seq, counts });
+            }
+        }
+        let Some((fence, at, seq)) = &self.pending else {
             return;
         };
         if !self.gpu.passed(fence) {
             return;
         }
         let took = at.elapsed();
+        telemetry::emit(Ev::PairGpu { seq: *seq, gpu_us: took.as_micros() as u32 });
         // Quick to grow (a frame shown late costs more than a little delay), slow to shrink.
         let w = if took > self.gpu_time { 0.5 } else { 0.1 };
         self.gpu_time = self.gpu_time.mul_f64(1.0 - w) + took.mul_f64(w);
         self.pending = None;
     }
 
-    /// Keeps `data` as the last frame, for spotting repeats; the one it replaces is reused.
-    fn keep_raw(&mut self, data: Option<Vec<u8>>) {
-        if let Some(old) = std::mem::replace(&mut self.last_raw, data) {
-            self.spare.give(old);
+    /// Keeps `data` as the last frame, for spotting repeats; the one it replaces is released.
+    fn keep_raw(&mut self, data: Option<(Vec<u8>, RawInfo)>) {
+        if let Some((old, info)) = std::mem::replace(&mut self.last_raw, data) {
+            self.release(old, info);
+        }
+    }
+
+    /// Done with a card frame: in a test session it's recorded (the input video takes the
+    /// buffer and gives it back when written), else it goes straight back for reuse.
+    fn release(&mut self, data: Vec<u8>, info: RawInfo) {
+        if !telemetry::on() {
+            self.spare.give(data);
+            return;
+        }
+        let spare = self.spare.clone();
+        let format = (info.w, info.h, info.layout);
+        let input = match telemetry::input_frame(data, format, info.fps, || Arc::new(move |b| spare.give(b))) {
+            Ok(at) => Some(at),
+            Err(data) => {
+                self.spare.give(data);
+                None
+            }
+        };
+        telemetry::emit(Ev::Capture { seq: info.seq, at: info.at, copy_us: info.copy_us, w: info.w, h: info.h, input });
+    }
+
+    /// Test sessions: what this card frame turned out to be.
+    fn frame_kind(&self, seq: u64, at: Instant, kind: FrameKind, held: u32) {
+        if telemetry::on() {
+            telemetry::emit(Ev::Frame { seq, at, recv: Instant::now(), kind, held });
         }
     }
 
@@ -694,6 +836,10 @@ impl Video<'_> {
             (f.w, f.h, f.layout, f.has_gen()) != (raw.w, raw.h, raw.decode.layout, smoothing)
         });
         if new_format {
+            telemetry::note("frames", || {
+                let fg = if smoothing { "on" } else { "off" };
+                format!("{}x{} {:?}, frame generation {fg}", raw.w, raw.h, raw.decode.layout)
+            });
             self.queue.clear();
             self.pair = None;
             self.key = None;
@@ -701,6 +847,8 @@ impl Video<'_> {
             self.next_out = 0;
             self.frames = None;
             self.frames = Some(Frames::with(&self.gpu, raw.w, raw.h, raw.decode.layout, smoothing)?);
+            let spare = self.spare.clone();
+            telemetry::input_format((raw.w, raw.h, raw.decode.layout), raw.fps, || Arc::new(move |b| spare.give(b)));
         }
         let new_decode = self.last_decode != Some(raw.decode);
         self.last_decode = Some(raw.decode);
@@ -712,19 +860,23 @@ impl Video<'_> {
             self.queue.clear();
             self.key = None;
             let slot = self.take_slot();
+            self.slot_seq[slot] = raw.seq;
             let f = self.frames.as_ref().expect("made above");
             f.upload(&self.gpu, &raw.data)?;
             f.decode(&self.gpu, slot, &raw.decode, false);
+            self.frame_kind(raw.seq, raw.at, FrameKind::Passthrough, 0);
             self.show(Showing::Slot(slot), Some(raw.at))?;
             // For the FPS counter, whether the game's picture changed: checked after
             // presenting, so it adds no delay.
             let checked = if self.shared.meter.is_on() {
-                let new = self.last_raw.as_ref().is_none_or(|prev| !same_picture(prev, &raw.data));
-                self.keep_raw(Some(raw.data));
+                let new = self.last_raw.as_ref().is_none_or(|prev| !same_picture(&prev.0, &raw.data));
+                let info = raw.info();
+                self.keep_raw(Some((raw.data, info)));
                 Some(new)
             } else {
                 self.keep_raw(None);
-                self.spare.give(raw.data);
+                let info = raw.info();
+                self.release(raw.data, info);
                 None
             };
             self.count_frame(raw.at, checked);
@@ -734,8 +886,9 @@ impl Video<'_> {
         let restart = gap || new_format || new_decode || self.key.is_none();
         if !restart {
             self.since_new += 1;
-            let repeat = self.last_raw.as_ref().is_some_and(|prev| same_picture(prev, &raw.data));
+            let repeat = self.last_raw.as_ref().is_some_and(|prev| same_picture(&prev.0, &raw.data));
             if repeat {
+                self.frame_kind(raw.seq, raw.at, FrameKind::Repeat, self.since_new);
                 self.count_frame(raw.at, Some(false));
                 // Nothing waiting to be shown (a still picture): the screen holds this one,
                 // as it does with smoothing off, so the counter counts it as a frame.
@@ -743,7 +896,8 @@ impl Video<'_> {
                     let seen = self.on_screen(Instant::now());
                     self.shared.meter.shown(seen, false, None);
                 }
-                self.keep_raw(Some(raw.data));
+                let info = raw.info();
+                self.keep_raw(Some((raw.data, info)));
                 return Ok(());
             }
         }
@@ -753,18 +907,26 @@ impl Video<'_> {
         self.generate(usize::MAX);
         self.pair = None;
         let slot = self.take_slot();
+        self.slot_seq[slot] = raw.seq;
         {
             let f = self.frames.as_ref().expect("made above");
             f.upload(&self.gpu, &raw.data)?;
             f.decode(&self.gpu, slot, &raw.decode, true);
         }
-        self.keep_raw(Some(raw.data));
+        let info = raw.info();
+        self.keep_raw(Some((raw.data, info)));
         let prev_key = self.key.replace(slot);
+        let mut kind = FrameKind::Restart;
+        let mut held_n = 0;
         let held = if restart {
             self.since_new = 0;
             None
         } else {
             let n = std::mem::take(&mut self.since_new);
+            held_n = n;
+            if n > MAX_CADENCE {
+                kind = FrameKind::AfterStill;
+            }
             let held = self.cadence.picture(n);
             if let Some(fps) = self.cadence.content_fps() {
                 self.shared.gpu.content_fps.store(fps.to_bits(), Ordering::Relaxed);
@@ -775,6 +937,7 @@ impl Video<'_> {
             if n > MAX_CADENCE { None } else { Some(held) }
         };
         let (Some(a), Some(held)) = (prev_key, held) else {
+            self.frame_kind(raw.seq, raw.at, kind, held_n);
             if let Some(f) = &mut self.frames {
                 f.forget_motion();
             }
@@ -794,9 +957,11 @@ impl Video<'_> {
         let by_refresh = (span / refresh + 0.25).floor().max(1.0) as u32;
         let steps = ((span * target as f64).round() as u32).clamp(1, MAX_STEPS).min(by_refresh);
         if steps <= 1 {
+            self.frame_kind(raw.seq, raw.at, FrameKind::Single, held_n);
             self.queue.clear();
             return self.show(Showing::Slot(slot), Some(raw.at));
         }
+        self.frame_kind(raw.seq, raw.at, FrameKind::Pair, held_n);
         let submitted = Instant::now();
         let f = self.frames.as_mut().expect("made above");
         // Two pairs' worth of generated frames (see `Frames::outs`), made the first time a
@@ -804,6 +969,9 @@ impl Video<'_> {
         f.ensure_outs(&self.gpu, 2 * (steps as usize - 1))?;
         let ring = f.outs.len();
         f.estimate(&self.gpu, a, slot);
+        if telemetry::on() {
+            f.request_counts(&self.gpu, raw.seq);
+        }
         self.pair = Some((a, slot));
         // The first frame now; the rest a step before each is due (see `Pending`).
         let mut made = Vec::with_capacity(steps as usize);
@@ -811,6 +979,7 @@ impl Video<'_> {
             let out = self.next_out;
             self.next_out = (self.next_out + 1) % ring;
             let t = j as f32 / steps as f32;
+            self.out_meta[out] = (raw.seq, t);
             if j == 1 {
                 f.interpolate(&self.gpu, a, slot, t, out);
                 made.push(Showing::Generated(out));
@@ -821,7 +990,7 @@ impl Video<'_> {
         if self.pending.is_none()
             && let Ok(fence) = self.gpu.fence()
         {
-            self.pending = Some((fence, submitted));
+            self.pending = Some((fence, submitted, raw.seq));
         }
 
         // Line the frames up on refreshes, `every` apart: the first right after the next
@@ -845,19 +1014,38 @@ impl Video<'_> {
             }
             None => (now, Duration::from_secs_f64(step)),
         };
+        let (mut skipped, mut backlog_cleared) = (0, false);
         if let Some(back) = self.queue.back() {
             let after = back.at + every;
             if after > first + Duration::from_secs_f64(span) {
                 // More than a picture's worth behind: let the backlog go.
+                backlog_cleared = true;
                 self.queue.clear();
             } else if after > first {
                 // Still busy with the last pair: carry on straight after it. A whole step or
                 // more behind (a slow pair pushed everything later), skip that many of this
                 // pair's first generated frames, so the delay doesn't stay.
                 let behind = ((after - first).as_secs_f64() / every.as_secs_f64()) as usize;
+                skipped = behind.min(made.len()) as u32;
                 made.drain(..behind.min(made.len()));
                 first = after;
             }
+        }
+        if telemetry::on() {
+            telemetry::emit(Ev::Pair(telemetry::PairPlan {
+                seq: raw.seq,
+                at: now,
+                held,
+                steps,
+                target,
+                content_fps: self.shared.gpu.content_fps(),
+                gpu_guess: self.gpu_time,
+                first,
+                every,
+                skipped,
+                backlog_cleared,
+                refresh: timing.map(|(_, p)| p),
+            }));
         }
         let last = made.len() as u32;
         for (j, what) in made.into_iter().enumerate() {

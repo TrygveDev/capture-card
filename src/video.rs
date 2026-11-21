@@ -2,7 +2,7 @@
 //! Raw NV12/YUY2 frames are converted here; anything else (MJPG, P010, ...) is converted by
 //! Media Foundation's video processor to RGB32 first.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -859,8 +859,10 @@ fn run(
             let decode = if hdr { o.fmt.gpu_hdr } else { o.fmt.gpu_sdr };
             let data = raw_frame(&sample, &o.fmt, presenter.buffer())?;
             let (w, h) = (o.fmt.width as u32, o.fmt.height as u32);
-            counted(shared, t0.elapsed());
-            presenter.push(RawFrame { data, w, h, decode, at: t0 });
+            let spent = t0.elapsed();
+            counted(shared, spent);
+            let (seq, copy_us, fps) = (next_seq(), spent.as_micros() as u32, o.mode.fps as f32);
+            presenter.push(RawFrame { data, w, h, decode, at: t0, seq, copy_us, fps });
         } else {
             let display_w = shared.display_w.load(Ordering::Relaxed) as usize;
             let image = convert_sample(&sample, &o.fmt, hdr, display_w)?;
@@ -868,6 +870,12 @@ fn run(
             show(shared, Arc::new(image));
         }
     }
+}
+
+/// Card frames are numbered across the whole run (test sessions follow each one through).
+fn next_seq() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 /// Counts a captured frame and the time spent preparing it.
@@ -1016,10 +1024,12 @@ fn test_pattern(shared: &VideoShared, presenter: &Presenter, fps: u32, content: 
                 full_range: false,
                 white_nits: HDR_WHITE_NITS as f32,
             };
-            counted(shared, t0.elapsed());
             let mut data = presenter.buffer();
             data.extend_from_slice(&buf);
-            presenter.push(RawFrame { data, w: W as u32, h: H as u32, decode, at: t0 });
+            let spent = t0.elapsed();
+            counted(shared, spent);
+            let (seq, copy_us) = (next_seq(), spent.as_micros() as u32);
+            presenter.push(RawFrame { data, w: W as u32, h: H as u32, decode, at: t0, seq, copy_us, fps: fps as f32 });
             continue;
         }
         let mut out = vec![0u8; W * H * 4];

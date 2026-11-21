@@ -31,6 +31,8 @@ optionally smooth it with frame generation.
 | `H` | HDR input |
 | `O` | FPS counter: off → numbers → graphs |
 | `T` / `P` | Always on top |
+| `R` | Start / stop a test session (see below) |
+| `B` | Bookmark this moment in the session ("something looked wrong here") |
 
 The capture mode (resolution and frame rate) and upscaling are in the menu on the controls.
 Settings are saved in `%APPDATA%\capture-card\settings.json`, and a log of the last run is next
@@ -69,6 +71,41 @@ target\release\capture-card.exe --install
 - `--stats`: print frame rate and latency every few seconds
 - `--test-pattern 60/30 [--test-size 3840x2160]`: run without a capture card (60 Hz signal
   carrying a 30 fps "game")
+
+## Test sessions
+
+To find out what happened when something looked or felt wrong, record a session: press `R`
+in the app (or start it with `--record`), play, press `B` the moment anything looks off, and
+press `R` again to stop. A red REC badge shows while recording. Each session is a folder in
+`%APPDATA%\capture-card\sessions\` with:
+
+- every card frame, every frame-generation pair (plan, GPU time, scene-cut and UI tests),
+  every present and when it really reached the screen (DXGI frame statistics),
+- CPU, memory, GPU load and memory, display rate, four times a second,
+- events: settings changes, log lines, bookmarks, signal loss,
+- `input_*.mkv`: the card's frames exactly as received (one video frame per card frame),
+- `output.mkv`: the screen under the window, each frame tagged with a small barcode in the
+  top-left corner, so every recorded frame maps back to the present that made it.
+
+Then analyse it (needs Python 3.9+ and ffmpeg on PATH):
+
+```sh
+python tools/analyze.py report --open            # the newest session
+python tools/analyze.py report SESSION_FOLDER --open
+python tools/analyze.py compare BEFORE AFTER      # e.g. before and after a change
+python tools/analyze.py extract SESSION --at 12.5 # that moment's pair as a clip for --gpu-eval
+python tools/analyze.py list
+```
+
+The report has the session's key numbers (frames on time, drops, frame time percentiles,
+latency, GPU time per pair, CPU/GPU/memory), zoomable timelines with the bookmarks marked,
+and a ranked list of incidents (drops, frames shown longer or shorter than planned, capture
+gaps, GPU overruns, UI fallbacks, bookmarks) with thumbnails of the input pair and of what was
+on screen frame by frame.
+
+Flags: `--record-dir DIR` to choose the folder, `--record-no-input` / `--record-no-output` to
+leave out a video (recording the screen costs some GPU, so leave it out when measuring load).
+`python tools/analyze.py selftest` checks the barcode reader against the app's own shader.
 
 Developer checks: `--gpu-test IMAGE OUTDIR` (synthetic scene) and `--gpu-eval CLIP.y4m OUTDIR`
 (drops frames from a real clip, regenerates them and scores them against the originals).

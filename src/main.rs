@@ -10,6 +10,7 @@ mod meter;
 mod overlay;
 mod present;
 mod settings;
+mod telemetry;
 mod upscale;
 mod video;
 mod winutil;
@@ -45,6 +46,9 @@ const SIGNAL_TIMEOUT: Duration = Duration::from_millis(1000);
 const NUMBERS_EVERY: Duration = Duration::from_millis(250);
 /// How often the pointer is checked for hover / idle.
 const TICK: Duration = Duration::from_millis(30);
+
+/// Messages top right stay this long.
+const TOAST_FOR: Duration = Duration::from_millis(3000);
 
 const ICON_FONT: &str = "Segoe Fluent Icons";
 const ICON_VOLUME: &str = "\u{E995}";
@@ -100,6 +104,13 @@ struct Viewer {
     numbers: meter::Numbers,
     numbers_at: Option<Instant>,
     graphs: Option<(meter::Graph, Option<meter::Graph>)>,
+    /// Test sessions: what they record, one waiting for the video to start (`--record`),
+    /// bookmarks dropped, the REC badge's last shown second, and a short message.
+    record: telemetry::Options,
+    record_pending: bool,
+    bookmarks: u32,
+    rec_second: Option<u64>,
+    toast: Option<(String, Instant)>,
 }
 
 /// Frame-rate and latency counters, printed every few seconds with `--stats` (always in dev
@@ -200,6 +211,11 @@ impl Viewer {
 
     /// Polls the pointer: shows the controls while it moves over the window, hides them (and
     /// the cursor, in fullscreen) once it's been still a while.
+    /// More than a few seconds since start (the GPU path may never come: `--cpu`).
+    fn started_long_ago(&self) -> bool {
+        self.stats.started.elapsed() > Duration::from_secs(5)
+    }
+
     fn tick_stats(&mut self, cx: &mut Context<Self>) {
         // On the GPU path the presenter keeps (and prints) the numbers; these are for the CPU path.
         let gpu = self.video.gpu.ready.load(Ordering::Acquire);
@@ -232,6 +248,7 @@ impl Viewer {
             } else if let Some(total) = &s.total {
                 eprintln!("{}", total.report("TOTAL", &self.video));
             }
+            telemetry::stop();
             cx.quit();
         }
     }
@@ -260,6 +277,17 @@ impl Viewer {
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.tick_stats(cx);
         self.tick_overlay(cx);
+        // `--record`: once the video is drawing (the session records what it shows).
+        if self.record_pending && (self.video.gpu.ready.load(Ordering::Acquire) || self.started_long_ago()) {
+            self.record_pending = false;
+            self.toggle_recording(window, cx);
+        }
+        let second = telemetry::status().map(|(_, t)| t.as_secs());
+        let toast_live = self.toast.as_ref().is_some_and(|(_, at)| at.elapsed() < TOAST_FOR + TICK);
+        if second != self.rec_second || toast_live {
+            self.rec_second = second;
+            cx.notify();
+        }
         let Some(hwnd) = self.hwnd else { return };
         let scale = window.scale_factor();
         let cursor = winutil::cursor_in_client(hwnd);
@@ -347,6 +375,7 @@ impl Viewer {
 
     fn toggle_hdr(&mut self, cx: &mut Context<Self>) {
         self.settings.hdr = !self.settings.hdr;
+        telemetry::note("setting", || format!("hdr {}", self.settings.hdr));
         self.video.hdr.store(self.settings.hdr, Ordering::Relaxed);
         self.settings.save();
         cx.notify();
@@ -357,6 +386,7 @@ impl Viewer {
     fn cycle_smooth(&mut self, cx: &mut Context<Self>) {
         let hz = self.video.gpu.refresh_hz.load(Ordering::Relaxed);
         self.settings.smooth = next_smooth(self.settings.smooth, hz);
+        telemetry::note("setting", || format!("smooth {}", self.settings.smooth));
         self.video.gpu.target.store(self.settings.smooth, Ordering::Relaxed);
         self.settings.save();
         cx.notify();
@@ -365,6 +395,7 @@ impl Viewer {
     /// Cycles the FPS counter: off, the counter, the counter with graphs.
     fn cycle_overlay(&mut self, cx: &mut Context<Self>) {
         self.settings.overlay = self.settings.overlay.next();
+        telemetry::note("setting", || format!("overlay {:?}", self.settings.overlay));
         self.video.meter.set_on(self.settings.overlay != Overlay::Off);
         self.numbers = meter::Numbers::default();
         self.numbers_at = None;
@@ -384,6 +415,7 @@ impl Viewer {
 
     /// Captures in `mode` from now on (None: the best the device offers).
     fn pick_mode(&mut self, mode: Option<video::ModeKey>, cx: &mut Context<Self>) {
+        telemetry::note("setting", || format!("mode {mode:?}"));
         self.video.control.pick(mode);
         self.settings.mode = mode.map(|(w, h, f)| [w, h, f]);
         self.settings.save();
@@ -393,6 +425,7 @@ impl Viewer {
 
     fn set_range(&mut self, range: video::ColourRange, cx: &mut Context<Self>) {
         self.settings.range = range;
+        telemetry::note("setting", || format!("range {range:?}"));
         self.video.control.set_range(range);
         self.settings.save();
         cx.notify();
@@ -400,9 +433,105 @@ impl Viewer {
 
     fn toggle_rtx(&mut self, cx: &mut Context<Self>) {
         self.settings.rtx = !self.settings.rtx;
+        telemetry::note("setting", || format!("rtx {}", self.settings.rtx));
         self.video.gpu.rtx.store(self.settings.rtx, Ordering::Relaxed);
         self.settings.save();
         cx.notify();
+    }
+
+    /// What's known about this run, for a session's `session.json`.
+    fn session_context(&self, window: &Window) -> telemetry::SessionContext {
+        let b = window.window_bounds().get_bounds();
+        let info = serde_json::json!({
+            "app": {
+                "version": env!("CARGO_PKG_VERSION"),
+                "commit": env!("CAPTURE_CARD_COMMIT"),
+                "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+                "args": std::env::args().skip(1).collect::<Vec<_>>(),
+            },
+            "settings": &self.settings,
+            "video": {
+                "status": *self.video.status.lock().unwrap(),
+                "mode": *self.video.mode.lock().unwrap(),
+                "gpu_path": self.video.gpu.ready.load(Ordering::Acquire),
+                "scaling": format!("{:?}", self.video.gpu.scaling()),
+            },
+            "display": {
+                "refresh_hz": self.video.gpu.refresh_hz.load(Ordering::Relaxed),
+                "scale_factor": window.scale_factor(),
+                "fullscreen": window.is_fullscreen(),
+                "window": [f32::from(b.origin.x), f32::from(b.origin.y), f32::from(b.size.width), f32::from(b.size.height)],
+            },
+        });
+        telemetry::SessionContext { hwnd: self.hwnd.map(|h| h.0 as isize), info }
+    }
+
+    /// Starts or stops a test session.
+    fn toggle_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ctx = self.session_context(window);
+        match telemetry::toggle(&self.record, || ctx) {
+            Ok(Some(dir)) => {
+                self.bookmarks = 0;
+                self.toast(format!("Recording to {}", dir.display()));
+            }
+            Ok(None) => self.toast("Recording saved".to_string()),
+            Err(e) => self.toast(format!("Can't record: {e:#}")),
+        }
+        cx.notify();
+    }
+
+    /// Marks this moment in the session ("something looked wrong here").
+    fn bookmark(&mut self, cx: &mut Context<Self>) {
+        if !telemetry::on() {
+            self.toast("Not recording: R starts a session".to_string());
+        } else {
+            self.bookmarks += 1;
+            let n = self.bookmarks;
+            telemetry::note("bookmark", || n.to_string());
+            self.toast(format!("Bookmark {n}"));
+        }
+        cx.notify();
+    }
+
+    fn toast(&mut self, text: String) {
+        crate::log::line(&format!("ui: {text}"));
+        self.toast = Some((text, Instant::now()));
+    }
+
+    /// The REC badge and messages, top right.
+    fn badges(&self) -> Option<gpui::Div> {
+        let rec = telemetry::status().map(|(_, t)| {
+            let s = t.as_secs();
+            let marks = if self.bookmarks > 0 { format!("  \u{2691} {}", self.bookmarks) } else { String::new() };
+            format!("\u{25CF} REC {:02}:{:02}{marks}", s / 60, s % 60)
+        });
+        let toast = self.toast.as_ref().filter(|(_, at)| at.elapsed() < TOAST_FOR).map(|(t, _)| t.clone());
+        if rec.is_none() && toast.is_none() {
+            return None;
+        }
+        let pill = |text: String, color: u32| {
+            div()
+                .px(px(10.))
+                .py(px(4.))
+                .rounded(px(12.))
+                .bg(rgba(0x000000b0))
+                .text_color(rgb(color))
+                .text_size(px(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(text)
+        };
+        Some(
+            div()
+                .absolute()
+                .top(px(12.))
+                .right(px(12.))
+                .flex()
+                .flex_col()
+                .items_end()
+                .gap(px(6.))
+                .children(rec.map(|t| pill(t, 0xff5555)))
+                .children(toast.map(|t| pill(t, 0xffffff))),
+        )
     }
 
     /// The capture mode menu: what the device offers, and the upscaling switch.
@@ -898,6 +1027,8 @@ impl Render for Viewer {
                     "s" => this.cycle_smooth(cx),
                     "o" => this.cycle_overlay(cx),
                     "t" | "p" => this.toggle_pin(cx),
+                    "r" => this.toggle_recording(window, cx),
+                    "b" => this.bookmark(cx),
                     "up" => {
                         this.set_volume(this.settings.volume + 0.05, cx);
                         this.settings.save();
@@ -912,6 +1043,7 @@ impl Render for Viewer {
             }))
             .child(video)
             .children(overlay)
+            .children(self.badges())
             .when(self.controls_visible, |d| d.child(controls))
     }
 }
@@ -967,6 +1099,9 @@ struct Args {
     capture: Option<(Duration, std::path::PathBuf)>,
     /// Debug: keep the controls up with the mode menu open (for screenshots).
     show_menu: bool,
+    /// Start a test session as soon as the video is up.
+    record: bool,
+    record_opts: telemetry::Options,
 }
 
 fn parse_args() -> Args {
@@ -984,6 +1119,8 @@ fn parse_args() -> Args {
         cpu: false,
         capture: None,
         show_menu: false,
+        record: false,
+        record_opts: telemetry::Options::default(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -996,6 +1133,14 @@ fn parse_args() -> Args {
             "--fps" => a.overlay = args.next().and_then(|m| serde_json::from_value(serde_json::Value::String(m)).ok()),
             "--cpu" => a.cpu = true,
             "--show-menu" => a.show_menu = true,
+            // Test sessions (see telemetry.rs); R toggles one in the app too.
+            "--record" => a.record = true,
+            "--record-dir" => {
+                a.record = true;
+                a.record_opts.dir = args.next().map(Into::into);
+            }
+            "--record-no-input" => a.record_opts.input_video = false,
+            "--record-no-output" => a.record_opts.output_video = false,
             "--capture-after" => {
                 let secs = args.next().and_then(|s| s.parse().ok()).map(Duration::from_secs_f64);
                 a.capture = secs.zip(args.next().map(Into::into));
@@ -1063,6 +1208,14 @@ fn main() {
             let save: Vec<usize> = argv.get(5).map(|s| s.split(',').filter_map(|p| p.parse().ok()).collect()).unwrap_or_default();
             if let Err(e) = gputest::eval(argv[2].as_ref(), argv[3].as_ref(), skip, &save) {
                 eprintln!("gpu-eval: {e:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        // Debug: --mark-test IMAGE OUTDIR (test sessions' barcode, for tools/analyze.py selftest)
+        Some("--mark-test") if argv.len() >= 4 => {
+            if let Err(e) = gputest::mark_test(argv[2].as_ref(), argv[3].as_ref()) {
+                eprintln!("mark-test: {e:#}");
                 std::process::exit(1);
             }
             return;
@@ -1156,6 +1309,7 @@ fn main() {
     let (stats_enabled, exit_after, start_fullscreen) = (args.stats, args.exit_after, args.fullscreen);
     let (force_on_top, cpu_only, capture) = (args.on_top, args.cpu, args.capture.clone());
     let show_menu = args.show_menu;
+    let (record_now, record_opts) = (args.record, args.record_opts.clone());
 
     Application::new().run(move |cx: &mut App| {
         // Last position if it's still on a connected display, else centred.
@@ -1246,6 +1400,11 @@ fn main() {
                     numbers: meter::Numbers::default(),
                     numbers_at: None,
                     graphs: None,
+                    record: record_opts.clone(),
+                    record_pending: record_now,
+                    bookmarks: 0,
+                    rec_second: None,
+                    toast: None,
                     video,
                     audio,
                     settings,
@@ -1271,6 +1430,7 @@ fn main() {
             let weak = view.downgrade();
             window.on_window_should_close(cx, move |window, cx| {
                 let _ = weak.update(cx, |v, _| v.save_window(window));
+                telemetry::stop();
                 true
             });
             view
@@ -1279,4 +1439,5 @@ fn main() {
         cx.on_window_closed(|cx| cx.quit()).detach();
         cx.activate(true);
     });
+    telemetry::stop();
 }

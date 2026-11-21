@@ -36,6 +36,15 @@ cbuffer Params : register(b0) {
 #define F_BLACK 8
 #define F_SEED 16
 #define F_COUNT 32
+#define F_MARK 64
+
+// Test sessions recording the screen: a barcode of the present's number (fl.w, 16 bits) in the
+// top-left corner, so each frame of the recording maps back to the present that made it.
+// Cells of MARK_W x MARK_H pixels: white, black (references), 16 bits low first, then the
+// parity of the low and the high byte.
+#define MARK_W 8
+#define MARK_H 8
+#define MARK_CELLS 20
 
 #define L_NV12 0
 #define L_YUY2 1
@@ -738,6 +747,17 @@ float lanczos2(float x) {
 #define MAX_TAPS 18
 
 float4 present_ps(float4 pos : SV_Position) : SV_Target {
+    if ((fl.x & F_MARK) && pos.y < MARK_H && pos.x < MARK_W * MARK_CELLS) {
+        uint cell = (uint)pos.x / MARK_W;
+        uint code = fl.w & 0xFFFF;
+        uint bit;
+        if (cell == 0) bit = 1;
+        else if (cell == 1) bit = 0;
+        else if (cell < 18) bit = (code >> (cell - 2)) & 1;
+        else if (cell == 18) bit = countbits(code & 0xFF) & 1;
+        else bit = countbits(code >> 8) & 1;
+        return float4((float3)bit, 1.0);
+    }
     float2 p = pos.xy - rect.xy;
     if ((fl.x & F_BLACK) || any(p < 0.0) || any(p >= rect.zw)) return float4(0.0, 0.0, 0.0, 1.0);
     float2 src = float2(sz.zw);

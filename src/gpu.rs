@@ -31,6 +31,7 @@ const F_TEMPORAL: u32 = 4;
 const F_BLACK: u32 = 8;
 const F_SEED: u32 = 16;
 const F_COUNT: u32 = 32;
+const F_MARK: u32 = 64;
 
 /// The constant buffer every pass reads (gpu.hlsl's `Params`).
 #[repr(C)]
@@ -310,10 +311,23 @@ impl Gpu {
     }
 
     /// Draws `src` (or black) fitted into `rect` (x, y, w, h in pixels) on a `size` render target.
-    pub fn draw(&self, rtv: &ID3D11RenderTargetView, size: (u32, u32), src: Option<&Tex>, rect: [f32; 4]) {
+    /// Draws `src` (or black) fitted into `rect`; `mark` puts that number's barcode in the
+    /// top-left corner (test sessions recording the screen).
+    pub fn draw(
+        &self,
+        rtv: &ID3D11RenderTargetView,
+        size: (u32, u32),
+        src: Option<&Tex>,
+        rect: [f32; 4],
+        mark: Option<u32>,
+    ) {
+        let mut flags = if src.is_none() { F_BLACK } else { 0 };
+        if mark.is_some() {
+            flags |= F_MARK;
+        }
         let p = Params {
             sz: [0, 0, src.map_or(1, |t| t.w as i32), src.map_or(1, |t| t.h as i32)],
-            fl: [if src.is_none() { F_BLACK } else { 0 }, 0, 0, 0],
+            fl: [flags, 0, 0, mark.unwrap_or(0)],
             rect,
             ..Default::default()
         };
@@ -392,15 +406,21 @@ impl Gpu {
     }
 
     /// Copies a texture back to the CPU, rows packed (`bpp` bytes per pixel).
-    pub fn read(&self, t: &Tex, bpp: usize) -> Result<Vec<u8>> {
+    /// A CPU-readable texture the size and format of `t`.
+    fn staging_like(&self, t: &Tex) -> Result<ID3D11Texture2D> {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { t.tex.GetDesc(&mut desc) };
         desc.Usage = D3D11_USAGE_STAGING;
         desc.BindFlags = 0;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        desc.MiscFlags = 0;
         let mut staging = None;
         unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut staging))? };
-        let staging: ID3D11Texture2D = staging.context("no staging texture")?;
+        staging.context("no staging texture")
+    }
+
+    pub fn read(&self, t: &Tex, bpp: usize) -> Result<Vec<u8>> {
+        let staging = self.staging_like(t)?;
         let row = t.w as usize * bpp;
         let mut out = vec![0u8; row * t.h as usize];
         unsafe {
@@ -555,10 +575,12 @@ struct Gen {
     fin: [Tex; 2],
     keys: [Tex; 2],
     counts: Tex,
+    /// Copies of `counts` on their way back to the CPU (test sessions), and whose they are.
+    readback: Vec<(ID3D11Texture2D, Option<u64>)>,
 }
 
 /// Counters of a pair's motion (see gpu.hlsl's `CountsIn`).
-const COUNTS: usize = 6;
+pub const COUNTS: usize = 6;
 
 /// Most generated frames kept at once (each one frame in size): two pairs' worth at 30 -> 240.
 pub const OUTS: usize = 14;
@@ -666,6 +688,7 @@ impl Gen {
             fin: [level0()?, level0()?],
             keys: [gpu.tex(w, h, DXGI_FORMAT_R32_UINT, true)?, gpu.tex(w, h, DXGI_FORMAT_R32_UINT, true)?],
             counts: gpu.tex(COUNTS as u32, 1, DXGI_FORMAT_R32_UINT, true)?,
+            readback: Vec::new(),
         })
     }
 }
@@ -874,6 +897,45 @@ impl Frames {
         Ok((px, t.w as usize, t.h as usize))
     }
 
+    /// Copies this pair's counters for reading back later, without waiting (test sessions).
+    pub fn request_counts(&mut self, gpu: &Gpu, tag: u64) {
+        let Some(fg) = self.fg.as_mut() else { return };
+        let i = match fg.readback.iter().position(|r| r.1.is_none()) {
+            Some(i) => i,
+            None if fg.readback.len() < 8 => match gpu.staging_like(&fg.counts) {
+                Ok(t) => {
+                    fg.readback.push((t, None));
+                    fg.readback.len() - 1
+                }
+                Err(_) => return,
+            },
+            None => return,
+        };
+        unsafe { gpu.ctx.CopyResource(&fg.readback[i].0, &fg.counts.tex) };
+        fg.readback[i].1 = Some(tag);
+    }
+
+    /// Counters copied by `request_counts` that the GPU has finished, with their tags.
+    pub fn poll_counts(&mut self, gpu: &Gpu) -> Vec<(u64, [u32; COUNTS])> {
+        let mut out = Vec::new();
+        let Some(fg) = self.fg.as_mut() else { return out };
+        for (tex, tag) in &mut fg.readback {
+            let Some(t) = *tag else { continue };
+            let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+            let mapped = unsafe {
+                gpu.ctx.Map(&*tex, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32, Some(&mut m))
+            };
+            if mapped.is_err() {
+                continue;
+            }
+            let v: [u32; COUNTS] = std::array::from_fn(|i| unsafe { *(m.pData as *const u32).add(i) });
+            unsafe { gpu.ctx.Unmap(&*tex, 0) };
+            *tag = None;
+            out.push((t, v));
+        }
+        out
+    }
+
     /// The pair's counters (see gpu.hlsl's `CountsIn`), read back synchronously (tests only).
     pub fn counts(&self, gpu: &Gpu) -> Result<[u32; COUNTS]> {
         let b = gpu.read(&self.fg().counts, 4)?;
@@ -954,10 +1016,23 @@ impl Swap {
     }
 
     /// Draws `src` (or black) fitted into `rect` (x, y, w, h in pixels) and presents.
-    pub fn show(&self, gpu: &Gpu, src: Option<&Tex>, rect: [f32; 4]) -> Result<()> {
+    pub fn show(&self, gpu: &Gpu, src: Option<&Tex>, rect: [f32; 4], mark: Option<u32>) -> Result<()> {
         let rtv = self.rtv.as_ref().context("no back buffer")?;
-        gpu.draw(rtv, (self.w, self.h), src, rect);
+        gpu.draw(rtv, (self.w, self.h), src, rect, mark);
         unsafe { self.chain.Present(0, DXGI_PRESENT(0)).ok().context("Present")? };
         Ok(())
+    }
+
+    /// The swap chain's present count so far.
+    pub fn present_count(&self) -> Option<u32> {
+        unsafe { self.chain.GetLastPresentCount().ok() }
+    }
+
+    /// The latest present that reached the screen: its present count, the refresh it was
+    /// queued at, the vblank it was shown at and that vblank's QPC time.
+    pub fn frame_stats(&self) -> Option<(u32, u32, u32, i64)> {
+        let mut s = DXGI_FRAME_STATISTICS::default();
+        unsafe { self.chain.GetFrameStatistics(&mut s).ok()? };
+        Some((s.PresentCount, s.PresentRefreshCount, s.SyncRefreshCount, s.SyncQPCTime))
     }
 }
