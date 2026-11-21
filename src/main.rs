@@ -11,6 +11,7 @@ mod nvof;
 mod overlay;
 mod present;
 mod settings;
+mod spring;
 mod telemetry;
 mod upscale;
 mod video;
@@ -47,6 +48,10 @@ const SIGNAL_TIMEOUT: Duration = Duration::from_millis(1000);
 const NUMBERS_EVERY: Duration = Duration::from_millis(250);
 /// How often the pointer is checked for hover / idle.
 const TICK: Duration = Duration::from_millis(30);
+
+/// How far the controls slide to be out of view below the window (their height, their gap to
+/// the bottom, and their shadow).
+const BAR_TRAVEL: f32 = 76.0;
 
 /// Messages top right stay this long.
 const TOAST_FOR: Duration = Duration::from_millis(3000);
@@ -109,6 +114,12 @@ struct Viewer {
     /// bookmarks dropped, the REC badge's last shown second, and a short message.
     record: telemetry::Options,
     record_pending: bool,
+    /// The controls' slide: 0 in place, 1 out of view below; whether it's moving, when it was
+    /// last stepped, and whether Windows wants animations at all.
+    bar: spring::Spring,
+    bar_moving: bool,
+    bar_at: Instant,
+    animate: bool,
     bookmarks: u32,
     rec_second: Option<u64>,
     toast: Option<(String, Instant)>,
@@ -923,9 +934,24 @@ impl Render for Viewer {
         // Room above the controls, so the menu never runs off the top (it scrolls instead).
         let menu_room = (viewport.height - px(90.)).max(px(160.));
         let menu = self.menu_open.then(|| self.menu(menu_room, cx));
+        // Slide in from below the window and back out, on a spring; settled, no more frames.
+        let target = if self.controls_visible { 0.0 } else { 1.0 };
+        let now = Instant::now();
+        let dt = if self.bar_moving { now.duration_since(self.bar_at).as_secs_f32() } else { 0.0 };
+        self.bar_at = now;
+        if self.animate {
+            self.bar_moving = self.bar.step(target, dt);
+            if self.bar_moving {
+                window.request_animation_frame();
+            }
+        } else {
+            self.bar.snap(target);
+        }
+        let slide = self.bar.pos;
         let controls = div()
             .absolute()
-            .bottom(px(14.))
+            .bottom(px(14.0 - BAR_TRAVEL * slide))
+            .opacity((1.0 - 0.6 * slide).clamp(0.0, 1.0))
             .left_0()
             .right_0()
             .flex()
@@ -1090,7 +1116,7 @@ impl Render for Viewer {
             .child(video)
             .children(overlay)
             .children(self.badges())
-            .when(self.controls_visible, |d| d.child(controls))
+            .when(self.controls_visible || slide < 0.999, |d| d.child(controls))
     }
 }
 
@@ -1450,6 +1476,10 @@ fn main() {
                     graphs: None,
                     record: record_opts.clone(),
                     record_pending: record_now,
+                    bar: spring::Spring::at(1.0),
+                    bar_moving: false,
+                    bar_at: Instant::now(),
+                    animate: winutil::animations_enabled(),
                     bookmarks: 0,
                     rec_second: None,
                     toast: None,

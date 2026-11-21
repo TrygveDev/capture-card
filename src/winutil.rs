@@ -178,6 +178,24 @@ pub fn left_button_down() -> bool {
     unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000 != 0 }
 }
 
+/// Whether Windows wants interface animations (Settings > Accessibility > Visual effects >
+/// Animation effects).
+pub fn animations_enabled() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
+    let mut on = windows::core::BOOL(1);
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some(&mut on as *mut _ as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    ok.is_err() || on.as_bool()
+}
+
 pub fn set_topmost(hwnd: HWND, on: bool) {
     unsafe {
         let _ = SetWindowPos(
