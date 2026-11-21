@@ -436,6 +436,12 @@ fn run_render(shared: &AudioShared) -> Result<()> {
     };
     let mut gain = 0.0f32;
     let mut last_check = Instant::now();
+    // How full to keep the device's buffer: a period (what the engine takes per wake-up) and a
+    // little for a late wake-up. Filling all of it (1056 frames on a 480-frame period) kept
+    // 22 ms queued in the device for no reason; this keeps 14.
+    let keep = (stream.period_frames as usize + ms(4)).min(stream.buffer_frames as usize);
+    let mut dry = 0u32;
+    let mut dry_logged = Instant::now();
     unsafe { stream.client.Start()? };
 
     loop {
@@ -455,7 +461,15 @@ fn run_render(shared: &AudioShared) -> Result<()> {
         }
 
         let padding = unsafe { stream.client.GetCurrentPadding()? };
-        let avail = stream.buffer_frames.saturating_sub(padding) as usize;
+        if padding == 0 && !jit.prefilling {
+            dry += 1;
+        }
+        if dry > 0 && dry_logged.elapsed() >= Duration::from_secs(60) {
+            crate::log::line(&format!("audio: the output ran dry {dry} times in the last minute"));
+            dry = 0;
+            dry_logged = Instant::now();
+        }
+        let avail = keep.saturating_sub(padding as usize);
         if avail == 0 {
             continue;
         }
