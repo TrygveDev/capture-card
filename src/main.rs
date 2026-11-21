@@ -728,15 +728,18 @@ fn icon_button(id: &'static str, glyph: &'static str) -> gpui::Stateful<gpui::Di
 }
 
 /// A small text switch: filled white when on, outlined when off.
-fn chip(id: &'static str, label: impl Into<SharedString>, on: bool) -> gpui::Stateful<gpui::Div> {
+/// A toggle in the controls, `width` wide whatever it says (sized for its longest label), so
+/// the bar doesn't change width, and buttons don't move, as labels change.
+fn chip(id: &'static str, label: impl Into<SharedString>, on: bool, width: f32) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .h(px(24.))
-        .px(px(7.))
+        .w(px(width))
         .mx(px(2.))
         .flex()
         .flex_none()
         .items_center()
+        .justify_center()
         .rounded(px(5.))
         .cursor_pointer()
         .text_size(px(11.))
@@ -908,13 +911,13 @@ impl Render for Viewer {
             mode = format!("{mode} · {:.0}→{smooth}", content);
         }
 
-        let hdr_button = chip("hdr", "HDR", hdr).on_click(cx.listener(|this, _, _, cx| this.toggle_hdr(cx)));
+        let hdr_button = chip("hdr", "HDR", hdr, 38.).on_click(cx.listener(|this, _, _, cx| this.toggle_hdr(cx)));
         let smooth_label = if smooth == 0 { "SMOOTH".to_string() } else { format!("SMOOTH {smooth}") };
         let smooth_button =
-            chip("smooth", smooth_label, smooth > 0).on_click(cx.listener(|this, _, _, cx| this.cycle_smooth(cx)));
+            chip("smooth", smooth_label, smooth > 0, 84.).on_click(cx.listener(|this, _, _, cx| this.cycle_smooth(cx)));
         let overlay_mode = self.settings.overlay;
         let overlay_label = if overlay_mode == Overlay::Graph { "FPS GRAPH" } else { "FPS" };
-        let overlay_button = chip("fps", overlay_label, overlay_mode != Overlay::Off)
+        let overlay_button = chip("fps", overlay_label, overlay_mode != Overlay::Off, 78.)
             .on_click(cx.listener(|this, _, _, cx| this.cycle_overlay(cx)));
         // Inside the video's top-left corner (clear of black bars).
         let overlay = (signal && overlay_mode != Overlay::Off).then(|| {
@@ -985,9 +988,11 @@ impl Render for Viewer {
                     .child(overlay_button)
                     // The mode, which opens the capture mode menu.
                     .child(
+                        // A fixed width too: what it says changes with the scale and the game's rate.
                         div()
                             .id("mode")
                             .h(px(24.))
+                            .w(px(206.))
                             .px(px(6.))
                             .flex()
                             .flex_none()
@@ -999,8 +1004,14 @@ impl Render for Viewer {
                             .text_color(rgba(0xffffffb3))
                             .hover(|s| s.bg(rgba(0xffffff26)))
                             .when(self.menu_open, |d| d.bg(rgba(0xffffff26)))
-                            .child(if mode.is_empty() { "Mode".to_string() } else { mode })
-                            .child(div().font_family(ICON_FONT).text_size(px(9.)).child(ICON_CHEVRON_UP))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .child(if mode.is_empty() { "Mode".to_string() } else { mode }),
+                            )
+                            .child(div().flex_none().font_family(ICON_FONT).text_size(px(9.)).child(ICON_CHEVRON_UP))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.menu_open = !this.menu_open;
                                 cx.notify();
