@@ -12,7 +12,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -54,6 +54,11 @@ const DEFER_MARGIN: Duration = Duration::from_millis(2);
 /// 60 -> 120 at 240 Hz: 38.3 ms -> 33.6 ms to the screen, one interval in ~500 a refresh short.
 const WAITED: Duration = Duration::from_micros(1500);
 const SHORTEN_EVERY: Duration = Duration::from_secs(3);
+/// Captured frames that may wait for the presenter. Normally none or one does; but Present can
+/// block for seconds while Windows isn't taking the window's frames, and with no limit every
+/// captured frame piled up behind it (320 MB a second at 1440p60, some 750 at 4K60) and was
+/// then played back late. Past this, new frames are dropped.
+const BACKLOG: usize = 8;
 /// How long a pair's GPU work (motion and its generated frames) is assumed to take before
 /// it has been measured.
 const GPU_GUESS: Duration = Duration::from_millis(8);
@@ -173,7 +178,7 @@ impl Shared {
 }
 
 pub struct Presenter {
-    tx: Sender<RawFrame>,
+    tx: SyncSender<RawFrame>,
     spare: Spare,
 }
 
@@ -220,7 +225,7 @@ pub fn shared_numbers() -> (u32, u32, f32) {
 impl Presenter {
     pub fn spawn(shared: Arc<VideoShared>) -> Presenter {
         let _ = SHARED.set(shared.clone());
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(BACKLOG);
         let spare = Spare::default();
         let theirs = spare.clone();
         std::thread::Builder::new()
@@ -236,8 +241,11 @@ impl Presenter {
         Presenter { tx, spare }
     }
 
+    /// Never waits: a frame there's no room for is dropped, and its buffer filled again.
     pub fn push(&self, frame: RawFrame) {
-        let _ = self.tx.send(frame);
+        if let Err(TrySendError::Full(frame)) = self.tx.try_send(frame) {
+            self.spare.give(frame.data);
+        }
     }
 
     /// An empty buffer to copy the next frame into (with room for one, after the first few).
@@ -1361,5 +1369,37 @@ mod tests {
         assert!(same_picture(&a, &b), "noise within 2 levels");
         b[200] = 110;
         assert!(!same_picture(&a, &b));
+    }
+
+    #[test]
+    fn a_stalled_screen_does_not_pile_up_frames() {
+        let spare = Spare::default();
+        let (tx, rx) = mpsc::sync_channel(BACKLOG);
+        let presenter = Presenter { tx, spare: spare.clone() };
+        let decode = Decoding {
+            layout: crate::video::Layout::Nv12,
+            hdr: false,
+            matrix: crate::convert::Matrix::Bt709,
+            gamut_2020: false,
+            full_range: false,
+            white_nits: 203.0,
+        };
+        // A second of frames, with nothing taking them (Present is stuck).
+        for seq in 0..60 {
+            presenter.push(RawFrame {
+                data: vec![0; 16],
+                w: 4,
+                h: 2,
+                decode,
+                at: Instant::now(),
+                seq,
+                copy_us: 0,
+                fps: 60.0,
+            });
+        }
+        let waiting: Vec<u64> = rx.try_iter().map(|f| f.seq).collect();
+        assert!(waiting.len() <= 8, "{} frames piled up", waiting.len());
+        assert!(waiting.iter().copied().eq(0..waiting.len() as u64), "out of order: {waiting:?}");
+        assert!(spare.take().capacity() > 0, "dropped frames' buffers go back to be filled again");
     }
 }
