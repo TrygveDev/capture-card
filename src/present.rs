@@ -18,10 +18,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{HANDLE, HWND, RECT};
 use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows::Win32::System::Threading::{
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateEventW, CreateWaitableTimerExW, SetEvent, SetWaitableTimer,
+    TIMER_ALL_ACCESS, WaitForMultipleObjects,
+};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 use crate::gpu::{Decoding, Frames, Gpu, Swap};
@@ -43,22 +47,25 @@ const SIGNAL_TIMEOUT: Duration = Duration::from_millis(1000);
 const PRESENT_PHASE: f64 = 0.3;
 /// A new picture waits while a present is due within its GPU work plus this (see `run`).
 const DEFER_MARGIN: Duration = Duration::from_millis(2);
-/// The delay ratchet. Smoothing shows a picture after its in-between frames, so the last pair's
-/// picture is on screen shortly before the next one arrives. If it's still waiting when the
-/// next arrives (a late picture, an early one, a slow pair), the newcomer waits for it, starts
-/// later, and its picture shows later still: every pair after it inherits the delay, and
-/// nothing ever took it back (36.5 ms from arrival to screen in a 4K 30 -> 120 session where
-/// 31.5 is possible). So a picture that had to wait this long has its pair's last interval
-/// shortened by a refresh, which brings the schedule back; at most once per `SHORTEN_EVERY`, so
-/// a GPU too slow for the shorter delay doesn't get uneven pacing out of it. Test pattern 30 on
-/// 60 -> 120 at 240 Hz: 38.3 ms -> 33.6 ms to the screen, one interval in ~500 a refresh short.
-const WAITED: Duration = Duration::from_micros(1500);
-const SHORTEN_EVERY: Duration = Duration::from_secs(3);
+/// How long every pair must have had a refresh to spare before the grid moves one earlier (see
+/// `Grid`): at first and at least, at most (it backs off when moving proved too eager), and how
+/// soon after moving a late pair counts as that move's fault.
+const PATIENCE: Duration = Duration::from_secs(1);
+const MOST_PATIENCE: Duration = Duration::from_secs(60);
+const BLAME: Duration = Duration::from_secs(10);
+/// More room than a step and this many refreshes is the game's hiccup, caught up at once.
+const HICCUP: i64 = 3;
 /// Captured frames that may wait for the presenter. Normally none or one does; but Present can
 /// block for seconds while Windows isn't taking the window's frames, and with no limit every
 /// captured frame piled up behind it (320 MB a second at 1440p60, some 750 at 4K60) and was
 /// then played back late. Past this, new frames are dropped.
 const BACKLOG: usize = 8;
+/// The last of the wait before a present is spun, not slept: Windows' timers wake up to half a
+/// millisecond late (0.27 ms at the median), and that's delay on every frame.
+const SPIN: Duration = Duration::from_micros(400);
+/// While a pair's GPU work runs, how often to look whether it's done: its time is what the next
+/// pair's first frame is scheduled after, so seeing it late is delay too.
+const FENCE_POLL: Duration = Duration::from_micros(200);
 /// How long a pair's GPU work (motion and its generated frames) is assumed to take before
 /// it has been measured.
 const GPU_GUESS: Duration = Duration::from_millis(8);
@@ -180,6 +187,58 @@ impl Shared {
 pub struct Presenter {
     tx: SyncSender<RawFrame>,
     spare: Spare,
+    wake: Arc<Wake>,
+}
+
+/// What the presenter waits on between presents: a frame arriving, or a moment.
+struct Wake {
+    arrived: HANDLE,
+    timer: HANDLE,
+}
+
+// SAFETY: event and timer handles may be used from any thread.
+unsafe impl Send for Wake {}
+unsafe impl Sync for Wake {}
+
+impl Wake {
+    fn new() -> Wake {
+        unsafe {
+            Wake {
+                arrived: CreateEventW(None, false, false, None).expect("create an event"),
+                // Windows 10 1803 and later; before that the ordinary timer (a tick late).
+                timer: CreateWaitableTimerExW(None, None, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS.0)
+                    .or_else(|_| CreateWaitableTimerExW(None, None, 0, TIMER_ALL_ACCESS.0))
+                    .expect("create a timer"),
+            }
+        }
+    }
+
+    fn arrived(&self) {
+        unsafe {
+            let _ = SetEvent(self.arrived);
+        }
+    }
+
+    /// Returns when a frame arrives, or after `left` at the latest (to the microsecond when
+    /// that's within `SPIN`).
+    fn wait(&self, left: Duration) {
+        if left <= SPIN {
+            let until = Instant::now() + left;
+            while Instant::now() < until {
+                std::hint::spin_loop();
+            }
+            return;
+        }
+        // Relative, in 100 ns.
+        let due = -(((left - SPIN).as_nanos() / 100).max(1) as i64);
+        unsafe {
+            if SetWaitableTimer(self.timer, &due, 0, None, None, false).is_ok() {
+                WaitForMultipleObjects(&[self.arrived, self.timer], false, 50);
+            } else {
+                std::thread::sleep(left.min(Duration::from_millis(1)));
+            }
+        }
+    }
 }
 
 /// Frame buffers the presenter is done with, for the capture side to fill again. A 4K frame
@@ -228,23 +287,27 @@ impl Presenter {
         let (tx, rx) = mpsc::sync_channel(BACKLOG);
         let spare = Spare::default();
         let theirs = spare.clone();
+        let wake = Arc::new(Wake::new());
+        let woken = wake.clone();
         std::thread::Builder::new()
             .name("present".into())
             .spawn(move || {
                 crate::raise_thread_priority("Playback");
-                if let Err(e) = run(&shared, rx, theirs) {
+                if let Err(e) = run(&shared, rx, theirs, &woken) {
                     crate::log::line(&format!("gpu: {e:#}; falling back to the CPU path"));
                 }
                 shared.gpu.ready.store(false, Ordering::Release);
             })
             .expect("spawn present thread");
-        Presenter { tx, spare }
+        Presenter { tx, spare, wake }
     }
 
     /// Never waits: a frame there's no room for is dropped, and its buffer filled again.
     pub fn push(&self, frame: RawFrame) {
-        if let Err(TrySendError::Full(frame)) = self.tx.try_send(frame) {
-            self.spare.give(frame.data);
+        match self.tx.try_send(frame) {
+            Ok(()) => self.wake.arrived(),
+            Err(TrySendError::Full(frame)) => self.spare.give(frame.data),
+            Err(TrySendError::Disconnected(_)) => {}
         }
     }
 
@@ -264,6 +327,96 @@ pub fn same_picture(a: &[u8], b: &[u8]) -> bool {
         && a.par_chunks(CHUNK)
             .zip(b.par_chunks(CHUNK))
             .all(|(x, y)| x == y || x.iter().zip(y).all(|(p, q)| p.abs_diff(*q) <= 2))
+}
+
+/// Where each pair's frames go: an even grid, as early as the pictures allow.
+///
+/// Pictures don't come evenly (the 4K S: 16.67 ms apart, give or take 2). Showing each pair as
+/// soon as it's ready passes that on: ready falls now this side of a refresh, now that, and a
+/// step is one refresh or three instead of two (up to 12% of them in testing). So a pair follows
+/// the last at an even step; the grid moves later only when one can't make it, and a refresh
+/// earlier only once all of them for a while could have (or a hiccup would add delay for good:
+/// 36.5 ms from arrival to screen in a 4K 30 -> 120 session where 31.5 was possible).
+struct Grid {
+    /// When the last pair's real picture is due.
+    last: Option<Instant>,
+    /// The least room any pair had since `since`, in refreshes.
+    spare: i64,
+    since: Option<Instant>,
+    patience: Duration,
+    moved: Option<Instant>,
+}
+
+/// A pair's place on the grid.
+#[derive(Debug, PartialEq)]
+struct Place {
+    first: Instant,
+    /// Moved a refresh earlier where a step is only one refresh: leave a generated frame out.
+    skip: bool,
+}
+
+impl Grid {
+    fn new() -> Grid {
+        Grid { last: None, spare: i64::MAX, since: None, patience: PATIENCE, moved: None }
+    }
+
+    /// The next pair starts afresh.
+    fn forget(&mut self) {
+        self.last = None;
+        self.since = None;
+    }
+
+    /// Where a pair starts that can be shown from refresh `ready`, and could have been from
+    /// `could` if it hadn't waited behind the last picture's present.
+    fn place(&mut self, ready: Instant, could: Instant, every: Duration, refresh: Duration, now: Instant) -> Place {
+        let at = |first| Place { first, skip: false };
+        let Some(last) = self.last else {
+            self.since = None;
+            return at(ready);
+        };
+        let even = last + every;
+        let refreshes = |from: Instant| {
+            let d = if even >= from { (even - from).as_secs_f64() } else { -(from - even).as_secs_f64() };
+            (d / refresh.as_secs_f64()).round() as i64
+        };
+        let (room, room_if_prompt) = (refreshes(ready), refreshes(could));
+        let step = refreshes(last).max(1);
+        if room < 0 {
+            // Can't make it: later from here on.
+            if self.moved.take().is_some_and(|t| now.saturating_duration_since(t) < BLAME) {
+                self.patience = (self.patience * 2).min(MOST_PATIENCE);
+            }
+            self.since = None;
+            return at(ready);
+        }
+        if room_if_prompt > step.max(HICCUP) {
+            // A whole step behind (the game dropped a frame and is back): catch up at once.
+            self.since = None;
+            return at(ready);
+        }
+        if self.moved.is_some_and(|t| now.saturating_duration_since(t) >= BLAME) {
+            self.moved = None;
+            self.patience = (self.patience / 2).max(PATIENCE);
+        }
+        let since = *self.since.get_or_insert_with(|| {
+            self.spare = i64::MAX;
+            now
+        });
+        self.spare = self.spare.min(room_if_prompt);
+        let mut place = at(ready + refresh * room as u32);
+        if now.saturating_duration_since(since) >= self.patience {
+            let earlier = self.spare >= 1;
+            self.since = None;
+            if earlier && step == 1 {
+                place.skip = true;
+                self.moved = Some(now);
+            } else if earlier && room >= 1 {
+                place.first -= refresh;
+                self.moved = Some(now);
+            }
+        }
+        place
+    }
 }
 
 /// Card frame period and how long recent pictures were held.
@@ -405,13 +558,14 @@ fn catch_up(queue: &mut VecDeque<Entry>, first: Instant, every: Duration, refres
     let (Some(front), Some(back)) = (queue.front(), queue.back()) else {
         return (first, 0);
     };
-    if back.at + every <= first {
+    // On the even step, give or take: the vblank measured for each pair differs by microseconds.
+    if back.at + every <= first + refresh / 2 {
         return (first, 0);
     }
     let front_at = front.at;
     let r = refresh.as_secs_f64();
     // Whole refreshes from the next frame due to `first`: each waiting frame needs one.
-    let room = (first.saturating_duration_since(front_at).as_secs_f64() / r + 1e-6).floor() as usize;
+    let room = (first.saturating_duration_since(front_at).as_secs_f64() / r + 0.1).floor() as usize;
     let mut dropped = 0;
     while queue.len() > room.max(1) {
         let generated: Vec<usize> = (1..queue.len()).filter(|&i| !matches!(queue[i].what, Showing::Slot(_))).collect();
@@ -567,8 +721,7 @@ struct Video<'a> {
     /// How long a pair's GPU work takes (smoothed), and whether it's been measured yet.
     gpu_time: Duration,
     gpu_measured: bool,
-    /// When a pair was last shortened against the delay ratchet (see `WAITED`).
-    shortened: Option<Instant>,
+    grid: Grid,
     /// Slots of the pair the motion field is for, while it has frames still to generate.
     pair: Option<(usize, usize)>,
     /// A recent vblank (or the coming one), the refresh period, and when they were read: for
@@ -607,7 +760,7 @@ fn fit(client: (u32, u32), aspect: f32) -> [f32; 4] {
     [((vw - w) / 2.0).floor(), ((vh - h) / 2.0).floor(), w, h]
 }
 
-fn run(shared: &VideoShared, rx: Receiver<RawFrame>, spare: Spare) -> Result<()> {
+fn run(shared: &VideoShared, rx: Receiver<RawFrame>, spare: Spare, wake: &Wake) -> Result<()> {
     // Wait for the window.
     let hwnd = loop {
         if let Some(&h) = shared.gpu.hwnd.get() {
@@ -654,7 +807,7 @@ fn run(shared: &VideoShared, rx: Receiver<RawFrame>, spare: Spare) -> Result<()>
         meta: PresentMeta::default(),
         gpu_time: GPU_GUESS,
         gpu_measured: false,
-        shortened: None,
+        grid: Grid::new(),
         pair: None,
         refresh: None,
         upscaler,
@@ -743,7 +896,11 @@ fn run(shared: &VideoShared, rx: Receiver<RawFrame>, spare: Spare) -> Result<()>
             }
             continue;
         }
-        std::thread::sleep((front.at - now).min(Duration::from_millis(1)));
+        let mut left = front.at - now;
+        if v.pending.is_some() && left > SPIN {
+            left = left.min(SPIN + FENCE_POLL);
+        }
+        wake.wait(left);
     }
 }
 
@@ -878,6 +1035,7 @@ impl Video<'_> {
             if lost {
                 telemetry::note("signal_lost", || "no frame for a second: showing black".into());
                 self.queue.clear();
+                self.grid.forget();
                 self.key = None;
                 self.draw(Some(Showing::Black))?;
             } else {
@@ -1029,6 +1187,7 @@ impl Video<'_> {
     }
 
     fn arrive(&mut self, raw: RawFrame) -> Result<()> {
+        let taken = Instant::now();
         let target = self.shared.gpu.target.load(Ordering::Relaxed);
         let gap = match self.last_at {
             Some(t) => !self.cadence.frame(raw.at.saturating_duration_since(t).as_secs_f64()),
@@ -1071,6 +1230,7 @@ impl Video<'_> {
         if target == 0 {
             // Straight through: decode and present now.
             self.queue.clear();
+            self.grid.forget();
             self.key = None;
             let slot = self.take_slot();
             self.slot_seq[slot] = raw.seq;
@@ -1155,6 +1315,7 @@ impl Video<'_> {
                 f.forget_motion();
             }
             self.queue.clear();
+            self.grid.forget();
             return self.show(Showing::Slot(slot), Some(raw.at));
         };
 
@@ -1172,6 +1333,7 @@ impl Video<'_> {
         if steps <= 1 {
             self.frame_kind(raw.seq, raw.at, FrameKind::Single, held_n);
             self.queue.clear();
+            self.grid.forget();
             return self.show(Showing::Slot(slot), Some(raw.at));
         }
         self.frame_kind(raw.seq, raw.at, FrameKind::Pair, held_n);
@@ -1218,11 +1380,25 @@ impl Video<'_> {
                 let k = (step / period.as_secs_f64()).round().max(1.0) as u32;
                 // The first present: `PRESENT_PHASE` into a refresh, once the GPU has made the
                 // frame (`timing` was read before the work above).
-                let mut slot = next - period + period.mul_f64(PRESENT_PHASE);
-                while slot < now.max(ready) {
-                    slot += period;
+                let mut at = next - period + period.mul_f64(PRESENT_PHASE);
+                while at < now.max(ready) {
+                    at += period;
                 }
-                (slot, period * k)
+                // Had it not waited behind the last picture's present.
+                let prompt = raw.at + Duration::from_micros(raw.copy_us.into()) + (submitted - taken) + self.gpu_time;
+                let mut could = at;
+                while could >= prompt + period {
+                    could -= period;
+                }
+                let every = period * k;
+                let place = self.grid.place(at, could, every, period, now);
+                if place.skip {
+                    telemetry::note("pacing", || format!("picture {}: a generated frame left out to take delay back", raw.seq));
+                }
+                if place.skip && made.len() > 1 {
+                    made.remove(0);
+                }
+                (place.first, every)
             }
             None => (now, Duration::from_secs_f64(step)),
         };
@@ -1249,18 +1425,8 @@ impl Video<'_> {
             }));
         }
         let last = made.len() as u32;
-        let mut real_at = first + every * last;
-        // Waited behind the last pair's picture: show this one a refresh early (see `WAITED`).
-        // Only where an interval is two refreshes or more, so none gets shorter than one.
-        if let Some((_, period)) = timing
-            && now.saturating_duration_since(raw.at) > WAITED
-            && every >= period * 2
-            && self.shortened.is_none_or(|t| now.saturating_duration_since(t) >= SHORTEN_EVERY)
-        {
-            real_at -= period;
-            self.shortened = Some(now);
-            telemetry::note("pacing", || format!("picture {} shown a refresh early (it waited)", raw.seq));
-        }
+        let real_at = first + every * last;
+        self.grid.last = Some(real_at);
         for (j, what) in made.into_iter().enumerate() {
             self.queue.push_back(Entry { at: first + every * j as u32, what, arrived: None });
         }
@@ -1371,11 +1537,81 @@ mod tests {
         assert!(!same_picture(&a, &b));
     }
 
+    /// Runs a grid over pictures that could be shown from `ready` refreshes after each arrives
+    /// (every 8 refreshes, four steps of two): the gaps between pairs, in refreshes.
+    fn run_grid(ready: impl Fn(u32) -> u32, n: u32, step: u32) -> Vec<(i64, bool)> {
+        let r = Duration::from_micros(4167);
+        let t0 = Instant::now();
+        let mut g = Grid::new();
+        let mut out = vec![];
+        for i in 0..n {
+            let at = t0 + r * (8 * i + ready(i));
+            let before = g.last;
+            let place = g.place(at, at, r * step, r, t0 + r * (8 * i));
+            if let Some(b) = before {
+                let gap = (place.first.saturating_duration_since(b).as_secs_f64() / r.as_secs_f64()).round() as i64;
+                out.push((gap, place.skip));
+            }
+            let steps = 8 / step - u32::from(place.skip);
+            g.last = Some(place.first + r * step * (steps - 1));
+        }
+        out
+    }
+
+    #[test]
+    fn a_wobbly_vblank_is_not_a_backlog() {
+        let t0 = Instant::now();
+        let r = Duration::from_micros(4167);
+        let mut q = waiting(t0, r * 2, &[false, true]);
+        let due: Vec<Instant> = q.iter().map(|e| e.at).collect();
+        // The next pair on the even step, as a vblank measured 30 us early has it.
+        let first = due[1] + r * 2 - Duration::from_micros(30);
+        assert_eq!(catch_up(&mut q, first, r * 2, r), (first, 0));
+        assert!(q.iter().map(|e| e.at).eq(due));
+    }
+
+    #[test]
+    fn a_start_a_little_late_at_a_refresh_per_frame_is_taken_back() {
+        // Two refreshes late at first (the GPU's time not measured yet): no hiccup, and not for good.
+        let gaps = run_grid(|i| if i < 3 { 3 } else { 1 }, 300, 1);
+        assert_eq!(gaps.iter().filter(|(_, skip)| *skip).count(), 2);
+    }
+
+    #[test]
+    fn jitter_across_a_refresh_leaves_the_steps_even() {
+        let gaps = run_grid(|i| 1 + (i * 7919 % 13 > 6) as u32, 900, 2);
+        let uneven = gaps.iter().filter(|(g, _)| *g != 2).count();
+        assert!(uneven <= 1, "{uneven} uneven steps of {}", gaps.len());
+    }
+
+    #[test]
+    fn delay_after_a_late_picture_is_taken_back() {
+        let gaps = run_grid(|i| if i == 10 { 2 } else { 1 }, 300, 2);
+        assert_eq!(gaps.iter().filter(|(g, _)| *g == 3).count(), 1, "late once");
+        assert_eq!(gaps.iter().filter(|(g, _)| *g == 1).count(), 1, "and back once");
+        assert_eq!(gaps.iter().map(|(g, _)| g - 2).sum::<i64>(), 0);
+    }
+
+    #[test]
+    fn delay_is_taken_back_on_a_display_with_a_refresh_per_frame() {
+        // A step is one refresh: a generated frame is left out once.
+        let gaps = run_grid(|i| if i == 10 { 2 } else { 1 }, 300, 1);
+        assert_eq!(gaps.iter().filter(|(_, skip)| *skip).count(), 1);
+    }
+
+    #[test]
+    fn moving_earlier_too_eagerly_backs_off() {
+        // One picture in 100 needs a refresh more.
+        let gaps = run_grid(|i| if i % 100 == 99 { 2 } else { 1 }, 5000, 2);
+        let uneven = gaps.iter().filter(|(g, _)| *g != 2).count();
+        assert!(uneven <= 30, "{uneven} uneven steps");
+    }
+
     #[test]
     fn a_stalled_screen_does_not_pile_up_frames() {
         let spare = Spare::default();
         let (tx, rx) = mpsc::sync_channel(BACKLOG);
-        let presenter = Presenter { tx, spare: spare.clone() };
+        let presenter = Presenter { tx, spare: spare.clone(), wake: Arc::new(Wake::new()) };
         let decode = Decoding {
             layout: crate::video::Layout::Nv12,
             hdr: false,
