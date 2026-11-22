@@ -20,8 +20,9 @@ app the first time (the exe isn't code-signed): *More info › Run anyway*.
 ## Features
 
 - **Low latency**: frames go straight from the card to a GPU swap chain (about 1–2 ms from
-  arrival to present with frame generation off). Audio passthrough keeps its buffer trimmed so
-  delay doesn't build up.
+  arrival to present with frame generation off). With it on, frames go out on an even grid that
+  follows the card's uneven timing without passing it on. Sound is passed on as it arrives, with
+  just enough buffered for the card's and the PC's timing.
 - **Frame generation** ("SMOOTH"): a 30 fps game shown at 60, 120 or 240 fps. Repeated card
   frames are detected, so the game's real frame rate is used, and in-between frames are made
   with bidirectional optical flow on the GPU (D3D11 compute shaders). Any vendor's GPU works.
@@ -34,7 +35,9 @@ app the first time (the exe isn't code-signed): *More info › Run anyway*.
 - **Hidden from recordings**: the controls stay out of screenshots, OBS and Discord (they see
   only the video), on Windows 10 2004 and later.
 - **Ready when the console is**: Passthru can wait in the tray, start with Windows, open when a
-  signal arrives and close again when it's gone. While it waits it draws and plays nothing.
+  signal arrives and close again when it's gone. In the tray it's only an icon: no CPU, under
+  1 MB of memory, no GPU, and the capture card is free for other programs. Watching for a
+  signal, it glances at the card once a second in its cheapest mode (under 1% of one core).
 
 ## Keys
 
@@ -57,14 +60,18 @@ on the controls; the window, the background and updates are under the gear (Sett
 | Always on top | Keeps the window above others (also `T`) |
 | Open in fullscreen | Goes fullscreen whenever the window opens |
 | Hide controls from recordings | Screenshots, OBS and Discord see only the video (on by default) |
-| Open when a signal arrives | Closing the window leaves Passthru in the tray; it opens again when the console sends a picture |
-| Close when the signal is lost | After 10 s without a signal: back to the tray, or quit if it isn't waiting there |
+| Open when a signal arrives | Closing the window leaves Passthru in the tray; it opens again when a picture arrives. Closed while the console is on, it waits for that picture to go away first |
+| Close when the signal is lost | After 10 s without frames, or 30 s of blank picture and silence: back to the tray, or quit if it isn't waiting there |
 | Start with Windows | Starts in the tray at sign-in (installed app only) |
 | Update automatically | Checks GitHub about once a day; *Check for updates* checks now |
 
+Cards differ in what they send with nothing connected. Frames that stop and flat frames count
+as no signal, and so does the Elgato 4K S's *NO SIGNAL* screen. Another card's own no-signal
+screen counts as a picture, so the two signal settings won't work with one that shows such a screen.
+
 Only one Passthru runs at a time: opening it again brings up the one already running (in the
 tray, say). Settings are saved in `%APPDATA%\Passthru\settings.json`, and a log of
-the last run is next to it in `log.txt`.
+the last run is next to it in `log.txt` (the run before in `log.prev.txt`).
 
 ## Tips for the lowest delay
 
