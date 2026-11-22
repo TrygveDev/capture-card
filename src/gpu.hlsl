@@ -12,6 +12,8 @@
 //     the other picture, and borrows the motion of similar visible pixels nearby. Where motion
 //     doesn't explain the change better than standing still (fades, flashes, particles), the
 //     field is marked unreliable.
+//     A menu changing in place is told apart here too (flow_inplace): that shows the new
+//     picture at once, or cross-fades if the rest moves.
 //  3. For each in-between time t, every pixel of A is pushed forward along its motion and every
 //     pixel of B backward; where several land on one spot, the one visible in both pictures
 //     (then the slower one) wins. A spot reached from only one side shows only that side, which
@@ -73,7 +75,8 @@ Texture2D<float4> FB        : register(t17);
 Texture2D<uint>   CountsIn  : register(t18); // per pair, A->B: 0 patches missed, 1 textured patches,
                                              // 2, 3 their cost and detail (the cut test), 4 level-0
                                              // pixels that changed, 5 of those motion can't follow,
-                                             // 6 of those hidden, 7 visible but unexplained
+                                             // 6 of those hidden, 7 visible but unexplained,
+                                             // 8 blocks inverted in place, 9 pixels changed a lot
 Texture2D<float4> Shown     : register(t19);
 Texture2D<float4> InfoIn    : register(t20);
 Texture2D<float4> FX        : register(t21); // the picture motion is measured from, in colour
@@ -548,6 +551,66 @@ void flow_snap(uint3 id : SV_DispatchThreadID) {
 #define LOST_START 0.55
 #define LOST_RAMP 0.1
 
+// The in-place test, for what the UI-change test misses: a highlight jumping rows matches
+// perfectly well as a bar that moved (the better the search, the better it matches), so too
+// little counts as lost and the text under it gets torn. But that text inverts where it is: the
+// same edges at the same spot, pointing the other way. An 8x8 block counts when INV_FILL of it
+// changed by over INV_CHANGED levels and its edges (INV_EDGES at least, in two directions:
+// one straight edge also flips when a bar moves by its own width) correlate below INV_CORR.
+// With INV_BLOCKS of those (fewer on planes smaller than INV_PLANE), making up INV_SHARE of
+// what changed, it's a menu: with under INV_STILL of the picture changed the generated frames
+// show the new picture (it's here already: crisp, and the press shows sooner), else they
+// cross-fade. On 6,500 pairs of gameplay, cutscenes and a moving map none counted.
+#define INV_CHANGED 24.0
+#define INV_STRONG 16.0
+#define INV_FILL 0.7
+#define INV_EDGES 20000.0
+#define INV_TWO_WAYS 0.2
+#define INV_CORR -0.8
+#define INV_BLOCKS 8
+#define INV_SHARE 0.02
+#define INV_PLANE (960.0 * 540.0)
+#define INV_STILL 0.15
+
+// How two-directional the edges with these sums of squares are: 0 one straight edge, 1 all ways.
+float two_ways(float xx, float yy, float xy) {
+    return 4.0 * (xx * yy - xy * xy) / ((xx + yy) * (xx + yy) + 1.0);
+}
+
+[numthreads(1, 1, 1)]
+void flow_inplace(uint3 id : SV_DispatchThreadID) {
+    int2 o = int2(id.xy) * 8;
+    float3 ea = 0.0; // sums of gx^2, gy^2, gx gy
+    float3 eb = 0.0;
+    float ab = 0.0;
+    uint full = 0;
+    uint strong = 0;
+    [loop] for (int i = 0; i < 64; i++) {
+        int2 p = o + int2(i & 7, i >> 3);
+        float d = abs(ly(p) - lx(p));
+        full += d > INV_CHANGED ? 1 : 0;
+        strong += d > INV_STRONG ? 1 : 0;
+    }
+    if (strong == 0) return;
+    uint old;
+    InterlockedAdd(Counts[int2(9, 0)], strong, old);
+    if ((float)full < INV_FILL * 64.0) return;
+    [loop] for (int j = 0; j < 64; j++) {
+        int2 p = o + int2(j & 7, j >> 3);
+        float2 ga = float2(lx(p + int2(1, 0)) - lx(p - int2(1, 0)), lx(p + int2(0, 1)) - lx(p - int2(0, 1)));
+        float2 gb = float2(ly(p + int2(1, 0)) - ly(p - int2(1, 0)), ly(p + int2(0, 1)) - ly(p - int2(0, 1)));
+        ea += float3(ga * ga, ga.x * ga.y);
+        eb += float3(gb * gb, gb.x * gb.y);
+        ab += dot(ga, gb);
+    }
+    float la = ea.x + ea.y;
+    float lb = eb.x + eb.y;
+    if (min(la, lb) <= INV_EDGES) return;
+    if (ab > INV_CORR * sqrt(la * lb)) return;
+    if (min(two_ways(ea.x, ea.y, ea.z), two_ways(eb.x, eb.y, eb.z)) <= INV_TWO_WAYS) return;
+    InterlockedAdd(Counts[int2(8, 0)], 1, old);
+}
+
 // x: mismatch with the opposite flow (relative, see above); y: |Y moved - X|; z: |Y unmoved - X|.
 [numthreads(8, 8, 1)]
 void flow_check(uint3 id : SV_DispatchThreadID) {
@@ -756,6 +819,16 @@ void compose(uint3 id : SV_DispatchThreadID) {
     uint changed = CountsIn.Load(int3(4, 0, 0));
     uint lost = CountsIn.Load(int3(5, 0, 0));
     float ui = changed > 0 ? saturate(((float)lost / (float)changed - LOST_START) / LOST_RAMP) : 0.0;
+    uint inverted = CountsIn.Load(int3(8, 0, 0));
+    uint strong = CountsIn.Load(int3(9, 0, 0));
+    float plane = (float)sz.x * (float)sz.y / (misc.y * misc.y);
+    if ((float)inverted >= INV_BLOCKS * min(1.0, plane / INV_PLANE) && 64.0 * (float)inverted >= INV_SHARE * (float)strong) {
+        if ((float)changed < INV_STILL * plane) {
+            OutInterp[p] = FB.Load(int3(p, 0));
+            return;
+        }
+        ui = 1.0;
+    }
     if (ui >= 1.0) {
         OutInterp[p] = float4(lerp(FA.Load(int3(p, 0)).rgb, FB.Load(int3(p, 0)).rgb, t), 1.0);
         return;

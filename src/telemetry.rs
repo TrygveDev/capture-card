@@ -398,7 +398,7 @@ const STREAMS: &[(&str, &str)] = &[
         "seq,t_us,held,steps,target,content_fps,gpu_guess_us,first_us,every_us,skipped,backlog_cleared,refresh_us",
     ),
     ("pair_gpu", "seq,gpu_us"),
-    ("pair_counts", "seq,missed,textured,cost,detail,changed,lost,hidden,unexplained"),
+    ("pair_counts", "seq,missed,textured,cost,detail,changed,lost,hidden,unexplained,inverted,strong"),
     ("presents", "n,swap_count,kind,seq,t,due_us,call_us,done_us,arrived_us,queued"),
     ("display", "present_count,refresh,sync_refresh,sync_us"),
     (
@@ -484,7 +484,10 @@ impl Session {
             Ev::PairCounts { seq, counts: c } => {
                 self.row(
                     "pair_counts",
-                    format_args!("{seq},{},{},{},{},{},{},{},{}", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]),
+                    format_args!(
+                        "{seq},{},{},{},{},{},{},{},{},{},{}",
+                        c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9]
+                    ),
                 )
             }
             Ev::Present(p) => {
@@ -1130,7 +1133,7 @@ mod tests {
         emit(Ev::Capture { seq: 1, at: t, copy_us: 900, w: 64, h: 32, input: None });
         emit(Ev::Frame { seq: 1, at: t, recv: t, kind: FrameKind::Pair, held: 2 });
         emit(Ev::PairGpu { seq: 1, gpu_us: 2500 });
-        emit(Ev::PairCounts { seq: 1, counts: [1, 2, 3, 4, 5, 6, 7, 8] });
+        emit(Ev::PairCounts { seq: 1, counts: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] });
         emit(Ev::Displayed { present_count: 7, refresh: 100, sync_refresh: 101, sync_qpc: 0 });
         emit(Ev::Displayed { present_count: 7, refresh: 100, sync_refresh: 101, sync_qpc: 0 });
         note("bookmark", || "1".into());
@@ -1142,7 +1145,7 @@ mod tests {
         assert_eq!(rows(&dir, "capture"), ["1,".to_string() + &us(t).to_string() + ",900,64,32,,"]);
         assert_eq!(rows(&dir, "frames").len(), 1);
         assert!(rows(&dir, "frames")[0].ends_with(",pair,2"));
-        assert_eq!(rows(&dir, "pair_counts"), ["1,1,2,3,4,5,6,7,8"]);
+        assert_eq!(rows(&dir, "pair_counts"), ["1,1,2,3,4,5,6,7,8,9,10"]);
         assert_eq!(rows(&dir, "display").len(), 1, "repeated statistics are written once");
         let events = rows(&dir, "events");
         assert!(events.iter().any(|e| e.contains(",bookmark,\"1\"")));

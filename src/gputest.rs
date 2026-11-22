@@ -517,10 +517,10 @@ pub fn eval(clip: &Path, out_dir: &Path, skip: usize, keep: &[usize]) -> Result<
         gpu.wait_idle()?;
         gen_ms += t.elapsed().as_secs_f64() * 1000.0 / (skip - 1) as f64;
         let (a, b) = (read(&f, sa)?, read(&f, sb)?);
-        let [_, _, cost, detail, changed, lost, hidden, unexplained] = f.counts(&gpu)?;
+        let [_, _, cost, detail, changed, lost, hidden, unexplained, inverted, strong] = f.counts(&gpu)?;
         let ch = changed.max(1) as f64;
         let mut line = format!(
-            "pair {pair:2} ({ia}->{ib}) cost/detail {:.2} lost/changed {:.2} hidden {:.2} unexplained {:.2} ({changed}):",
+            "pair {pair:2} ({ia}->{ib}) cost/detail {:.2} lost/changed {:.2} hidden {:.2} unexplained {:.2} inverted {inverted}/{strong} ({changed}):",
             cost as f64 / detail.max(1) as f64,
             lost as f64 / ch,
             hidden as f64 / ch,
@@ -688,4 +688,101 @@ pub fn mark_test(src: &Path, out_dir: &Path) -> Result<()> {
     std::fs::write(out_dir.join("marks.txt"), list)?;
     println!("{} marked frames of {w}x{h} in {}", codes.len(), out_dir.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+
+    const W: usize = 1920;
+    const H: usize = 1080;
+
+    /// Whether (x, y) is ink of a row of made-up letters starting at (left, top): 8 cells of
+    /// 30 x 40, each some strokes both ways.
+    fn ink(x: usize, y: usize, left: usize, top: usize, row: usize) -> bool {
+        if !(left..left + 240).contains(&x) || !(top..top + 40).contains(&y) {
+            return false;
+        }
+        let (cx, cy) = ((x - left) % 30, y - top);
+        if cx >= 24 {
+            return false;
+        }
+        let bits = ((x - left) / 30 + 8 * row + 3).wrapping_mul(0x9E37_79B1);
+        (bits & 1 << 4 != 0 && cx < 6)
+            || (bits & 1 << 7 != 0 && cx >= 18)
+            || (bits & 1 << 9 != 0 && cy < 6)
+            || (bits & 1 << 12 != 0 && (17..23).contains(&cy))
+            || (bits & 1 << 14 != 0 && cy >= 34)
+            || (9..15).contains(&cx) && cy % 16 < 8
+    }
+
+    /// Six rows of text with row `on` highlighted, or the same rows moved down by `down`.
+    fn menu(on: usize, down: usize) -> Vec<u8> {
+        let mut f = vec![128u8; W * H * 3 / 2];
+        for y in 0..H {
+            for x in 0..W {
+                let mut v = 38;
+                for row in 0..6 {
+                    let top = 200 + 96 * row + down;
+                    let bar = row == on && (top..top + 72).contains(&y) && (40..560).contains(&x);
+                    if bar {
+                        v = 236;
+                    }
+                    if ink(x, y, 120, top + 16, row) {
+                        v = if row == on { 25 } else { 220 };
+                    }
+                }
+                f[y * W + x] = v;
+            }
+        }
+        f
+    }
+
+    /// The frame generated halfway from `a` to `b`, and how far it is from `want` in levels (the
+    /// worst 16x16 block).
+    fn halfway(gpu: &Gpu, a: &[u8], b: &[u8], want: &[u8]) -> Result<f64> {
+        let mut f = Frames::new(gpu, W as u32, H as u32, Layout::Nv12)?;
+        let dec = Decoding {
+            layout: Layout::Nv12,
+            hdr: false,
+            matrix: Matrix::Bt709,
+            gamut_2020: false,
+            full_range: true,
+            white_nits: 370.0,
+        };
+        for (slot, data) in [(0, a), (1, b)] {
+            f.upload(gpu, data)?;
+            f.decode(gpu, slot, &dec, true);
+        }
+        f.estimate(gpu, 0, 1);
+        f.interpolate(gpu, 0, 1, 0.5, 0);
+        gpu.wait_idle()?;
+        let out = rgb_of(&gpu.read(&f.outs[0], 4)?);
+        let mut worst = 0.0f64;
+        for by in 0..H / 16 {
+            for bx in 0..W / 16 {
+                let mut sum = 0.0;
+                for y in by * 16..by * 16 + 16 {
+                    for x in bx * 16..bx * 16 + 16 {
+                        sum += (out[y * W + x][1] as f64 - want[y * W + x] as f64).abs();
+                    }
+                }
+                worst = worst.max(sum / 256.0);
+            }
+        }
+        Ok(worst)
+    }
+
+    #[test]
+    fn a_highlight_jumping_rows_shows_at_once_and_a_scrolling_list_still_moves() {
+        // CI's machines have no GPU.
+        let Ok(gpu) = Gpu::new() else { return };
+        for (from, to) in [(3, 4), (4, 3), (1, 2), (0, 5)] {
+            let (a, b) = (menu(from, 0), menu(to, 0));
+            let off = halfway(&gpu, &a, &b, &b).unwrap();
+            assert!(off < 4.0, "row {from} to {to}: torn, {off:.1} levels from the new picture");
+        }
+        let off = halfway(&gpu, &menu(2, 0), &menu(2, 16), &menu(2, 8)).unwrap();
+        assert!(off < 40.0, "a scrolling list stopped moving: {off:.1} levels off");
+    }
 }

@@ -76,6 +76,7 @@ struct Kernels {
     flow_smooth: Kernel,
     flow_snap: Kernel,
     flow_check: Kernel,
+    flow_inplace: Kernel,
     flow_fill: Kernel,
     flow_final: Kernel,
     project: Kernel,
@@ -184,6 +185,7 @@ impl Gpu {
             "flow_smooth",
             "flow_snap",
             "flow_check",
+            "flow_inplace",
             "flow_fill",
             "flow_final",
             "project",
@@ -219,6 +221,7 @@ impl Gpu {
             flow_smooth: cs()?,
             flow_snap: cs()?,
             flow_check: cs()?,
+            flow_inplace: cs()?,
             flow_fill: cs()?,
             flow_final: cs()?,
             project: cs()?,
@@ -606,7 +609,7 @@ struct Gen {
 }
 
 /// Counters of a pair's motion (see gpu.hlsl's `CountsIn`).
-pub const COUNTS: usize = 8;
+pub const COUNTS: usize = 10;
 
 /// Most generated frames kept at once (each one frame in size): two pairs' worth at 30 -> 240.
 pub const OUTS: usize = 14;
@@ -1043,6 +1046,9 @@ impl Frames {
             let srvs = [(5, &sx.luma[0]), (6, &sy.luma[0]), (10, &fg.snapped[dir]), (11, &fg.snapped[1 - dir])];
             gpu.run(&gpu.k.flow_check, &p, &srvs, &[(2, &fg.info[dir])], g);
         }
+        // Whether text inverted where it is (a menu's highlight jumped: see the shader).
+        let luma = [(5, &pair(0).0.luma[0]), (6, &pair(0).1.luma[0])];
+        gpu.run(&gpu.k.flow_inplace, &p, &luma, &[(4, &fg.counts)], (pw / 8, ph / 8));
         // Filled motion goes through rough[0], free once the levels are done.
         let pf = Params {
             sz: [pw as i32, ph as i32, self.w as i32, self.h as i32],
