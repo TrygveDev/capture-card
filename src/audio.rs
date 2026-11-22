@@ -448,12 +448,64 @@ struct Jitter {
 }
 
 impl Jitter {
-    fn restart_windows(&mut self) {
+    fn new(margin: usize, now: Instant) -> Self {
+        Jitter {
+            margin,
+            least: isize::MAX,
+            least_long: isize::MAX,
+            window: now,
+            long_window: now,
+            adjust: 0,
+            prefilling: true,
+        }
+    }
+
+    fn restart_windows(&mut self, now: Instant) {
         self.least = isize::MAX;
         self.least_long = isize::MAX;
-        self.window = Instant::now();
-        self.long_window = self.window;
+        self.window = now;
+        self.long_window = now;
         self.adjust = 0;
+    }
+
+    /// A packet landed with `over` frames more than needed buffered (negative: too few) and
+    /// `spare` more than shedding keeps: says what to add or skip.
+    fn landed(&mut self, over: isize, spare: isize, guard: usize, now: Instant) {
+        // Part-way through an adjustment the buffer still shows what it's putting right:
+        // counted, that would be put right twice.
+        if self.adjust != 0 {
+            return;
+        }
+        let guard = guard as isize;
+        self.least = self.least.min(over);
+        self.least_long = self.least_long.min(spare);
+        if now.saturating_duration_since(self.window) < ADD_AFTER {
+            return;
+        }
+        if self.least < -guard / 2 {
+            let short = self.least;
+            self.restart_windows(now);
+            self.adjust = -short;
+        } else {
+            self.least = isize::MAX;
+            self.window = now;
+            if now.saturating_duration_since(self.long_window) >= SHED_AFTER {
+                let extra = self.least_long;
+                self.restart_windows(now);
+                if extra > guard {
+                    self.adjust = -extra;
+                }
+            }
+        }
+    }
+
+    /// `changed` frames of the adjustment were just made.
+    fn adjusted(&mut self, changed: isize, now: Instant) {
+        self.adjust -= changed;
+        if changed != 0 && self.adjust == 0 {
+            // Only what's buffered from here on counts.
+            self.restart_windows(now);
+        }
     }
 }
 
@@ -487,15 +539,7 @@ fn run_render(shared: &AudioShared) -> Result<()> {
     let ms = |m: usize| rate as usize * m / 1000;
     let period = (stream.period_frames as usize).max(1);
     let guard = ms(1);
-    let mut jit = Jitter {
-        margin: ms(MARGIN_MS),
-        least: isize::MAX,
-        least_long: isize::MAX,
-        window: Instant::now(),
-        long_window: Instant::now(),
-        adjust: 0,
-        prefilling: true,
-    };
+    let mut jit = Jitter::new(ms(MARGIN_MS), Instant::now());
     let mut gain = 0.0f32;
     // Queued still after the last write (the device's buffer was full).
     let mut carried = 0usize;
@@ -558,7 +602,7 @@ fn run_render(shared: &AudioShared) -> Result<()> {
             q.drain(..old * 2);
             queued -= old;
             jit.prefilling = false;
-            jit.restart_windows();
+            jit.restart_windows(now);
         } else if padding + carried == 0 {
             // Ran out (the device plays silence meanwhile): a little more margin from here.
             dry += 1;
@@ -570,32 +614,16 @@ fn run_render(shared: &AudioShared) -> Result<()> {
                 continue;
             }
             jit.prefilling = false;
-            jit.restart_windows();
+            jit.restart_windows(now);
         } else if queued > carried {
             // A packet landed: how much there was without it, against what that has to be.
             let since = (now.saturating_duration_since(engine_at).as_secs_f64() * rate as f64) as usize;
             let ahead = period.saturating_sub(since);
             let have = (padding + carried) as isize;
-            jit.least = jit.least.min(have - needed(ahead, jit.margin, period, guard) as isize);
+            let over = have - needed(ahead, jit.margin, period, guard) as isize;
             // Shedding wants a little over the margin, not to be added straight back.
-            jit.least_long = jit.least_long.min(have - needed(ahead, jit.margin + guard, period, guard) as isize);
-            if now.saturating_duration_since(jit.window) >= ADD_AFTER {
-                if jit.least < -(guard as isize) / 2 {
-                    let short = jit.least;
-                    jit.restart_windows();
-                    jit.adjust = -short;
-                } else {
-                    jit.least = isize::MAX;
-                    jit.window = now;
-                    if now.saturating_duration_since(jit.long_window) >= SHED_AFTER {
-                        let extra = jit.least_long;
-                        jit.restart_windows();
-                        if extra > guard as isize {
-                            jit.adjust = -extra;
-                        }
-                    }
-                }
-            }
+            let spare = have - needed(ahead, jit.margin + guard, period, guard) as isize;
+            jit.landed(over, spare, guard, now);
             if jit.margin > ms(MARGIN_MS) && grown_at.elapsed() >= MARGIN_BACK {
                 jit.margin = jit.margin.saturating_sub(ms(MARGIN_STEP_MS)).max(ms(MARGIN_MS));
                 grown_at = now;
@@ -633,7 +661,7 @@ fn run_render(shared: &AudioShared) -> Result<()> {
             write_frame(data, i, &stream, sample.0 * gain, sample.1 * gain);
         }
         gain = target;
-        jit.adjust -= changed;
+        jit.adjusted(changed, now);
         carried = q.len() / 2;
         held += write;
         drop(q);
@@ -663,7 +691,31 @@ fn write_frame(data: *mut u8, i: usize, s: &Stream, l: f32, r: f32) {
 
 #[cfg(test)]
 mod tests {
-    use super::needed;
+    use super::{ADJUST_ONE_IN, Jitter, needed};
+    use std::time::{Duration, Instant};
+
+    /// The card's clock drifting past the engine's leaves it a period short, or with one spare.
+    #[test]
+    fn makes_up_a_period_once() {
+        let (period, guard) = (480isize, 48);
+        let a_write = period / ADJUST_ONE_IN as isize;
+        for start in [-period, period] {
+            let t0 = Instant::now();
+            let mut jit = Jitter::new(288, t0);
+            let mut over = start;
+            let mut furthest = 0;
+            // A packet every 10 ms for 20 s.
+            for n in 0..2000 {
+                let now = t0 + Duration::from_millis(10 * n);
+                jit.landed(over, over, guard, now);
+                let changed = jit.adjust.clamp(-a_write, a_write);
+                jit.adjusted(changed, now);
+                over += changed;
+                furthest = if start < 0 { furthest.max(over) } else { furthest.min(over) };
+            }
+            assert_eq!((over, furthest), (0, 0), "starting {start} out");
+        }
+    }
 
     #[test]
     fn buffers_whole_periods_for_the_margin() {
