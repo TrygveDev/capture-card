@@ -26,6 +26,8 @@ app the first time (the exe isn't code-signed): *More info › Run anyway*.
 - **Frame generation** ("SMOOTH"): a 30 fps game shown at 60, 120 or 240 fps. Repeated card
   frames are detected, so the game's real frame rate is used, and in-between frames are made
   with bidirectional optical flow on the GPU (D3D11 compute shaders). Any vendor's GPU works.
+  A menu highlight jumping to another row isn't smoothed: where the text under it inverts,
+  the new picture shows at once (or cross-fades, if the rest of the picture moves).
 - **Upscaling**: NVIDIA RTX Video Super Resolution when it's available, otherwise a Lanczos
   shader.
 - **HDR**: HDR10 input is tone mapped to SDR.
