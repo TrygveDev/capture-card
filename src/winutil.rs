@@ -49,7 +49,7 @@ static MAIN: AtomicIsize = AtomicIsize::new(0);
 const FOLLOW_MSG: u32 = WM_APP + 2;
 
 /// The tray icon's messages to the window.
-const TRAY_MSG: u32 = WM_APP + 1;
+pub const TRAY_MSG: u32 = WM_APP + 1;
 const TRAY_ID: u32 = 1;
 static TRAY_ON: AtomicBool = AtomicBool::new(false);
 /// Explorer's "the taskbar was (re)created" message: the icon has to be added again.
@@ -157,7 +157,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             TRAY_MSG => {
                 match (lparam.0 & 0xFFFF) as u32 {
                     WM_LBUTTONUP => send(Event::Open),
-                    WM_RBUTTONUP | WM_CONTEXTMENU => tray_menu(hwnd),
+                    WM_RBUTTONUP | WM_CONTEXTMENU => {
+                        if let Some(e) = tray_menu(hwnd) {
+                            send(e);
+                        }
+                    }
                     _ => {}
                 }
                 return LRESULT(0);
@@ -318,10 +322,10 @@ fn send(e: Event) {
     }
 }
 
-/// The tray icon's right-click menu: Open, Quit.
-unsafe fn tray_menu(hwnd: HWND) {
+/// The tray icon's right-click menu: Open, Quit. Returns what was picked.
+pub fn tray_menu(hwnd: HWND) -> Option<Event> {
     unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return };
+        let Ok(menu) = CreatePopupMenu() else { return None };
         let _ = AppendMenuW(menu, MF_STRING, 1, &windows::core::HSTRING::from("Open Passthru"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, 2, &windows::core::HSTRING::from("Quit"));
@@ -332,9 +336,9 @@ unsafe fn tray_menu(hwnd: HWND) {
         let picked = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, p.x, p.y, None, hwnd, None);
         let _ = DestroyMenu(menu);
         match picked.0 {
-            1 => send(Event::Open),
-            2 => send(Event::Quit),
-            _ => {}
+            1 => Some(Event::Open),
+            2 => Some(Event::Quit),
+            _ => None,
         }
     }
 }
@@ -380,6 +384,11 @@ pub fn set_shown(hwnd: HWND, shown: bool) {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
     }
+}
+
+/// Minimised to the taskbar.
+pub fn minimised(hwnd: HWND) -> bool {
+    unsafe { IsIconic(hwnd).as_bool() }
 }
 
 /// The cursor in client pixels, if it's over this window (and not over another on top of it).

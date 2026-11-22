@@ -1,6 +1,7 @@
 //! A short record of what happened this run (devices opened, modes, format changes, stalls,
 //! errors), in %APPDATA%\Passthru\log.txt next to the settings, so odd behaviour can be
-//! looked at afterwards: the installed app has no console. Each run starts a fresh file.
+//! looked at afterwards: the installed app has no console. Each run starts a fresh file and
+//! keeps the one before as log.prev.txt (closing to the tray starts a new run).
 //! Everything also goes to stderr.
 
 use std::io::Write;
@@ -25,6 +26,7 @@ pub fn start() {
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    let _ = std::fs::rename(&p, p.with_file_name("log.prev.txt"));
     if let Ok(f) = std::fs::File::create(&p) {
         *FILE.lock().unwrap() = Some((f, 0));
     }

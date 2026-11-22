@@ -18,20 +18,22 @@ fn message(name: &str) -> u32 {
     unsafe { RegisterWindowMessageW(&HSTRING::from(name)) }
 }
 
-/// Posts `name` to every Passthru window (gpui's window class, titled Passthru, hidden ones
-/// too): only the running one understands it. Returns whether there was any.
+/// Posts `name` to every Passthru window (gpui's window class or the tray's, titled Passthru,
+/// hidden ones too): only the running one understands it. Returns whether there was any.
 fn post(name: &str) -> bool {
     let msg = message(name);
     let title = HSTRING::from(crate::app::NAME);
     let mut any = false;
-    let mut after = None;
     unsafe {
-        while let Ok(h) = FindWindowExW(None, after, w!("Zed::Window"), &title) {
-            if h.is_invalid() {
-                break;
+        for class in [w!("Zed::Window"), crate::tray::CLASS] {
+            let mut after = None;
+            while let Ok(h) = FindWindowExW(None, after, class, &title) {
+                if h.is_invalid() {
+                    break;
+                }
+                any |= PostMessageW(Some(h), msg, WPARAM(0), LPARAM(0)).is_ok();
+                after = Some(h);
             }
-            any |= PostMessageW(Some(h), msg, WPARAM(0), LPARAM(0)).is_ok();
-            after = Some(h);
         }
     }
     any

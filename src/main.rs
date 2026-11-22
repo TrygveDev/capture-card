@@ -9,12 +9,14 @@ mod install;
 mod instance;
 mod log;
 mod meter;
+mod no_signal;
 mod nvof;
 mod overlay;
 mod present;
 mod settings;
 mod spring;
 mod telemetry;
+mod tray;
 mod update;
 mod upscale;
 mod video;
@@ -59,9 +61,13 @@ const BAR_TRAVEL: f32 = 76.0;
 /// "Close when the signal is lost" waits this long: a console switching resolution or HDR
 /// drops the signal for a few seconds.
 const CLOSE_AFTER_LOSS: Duration = Duration::from_secs(10);
+/// Frames with no picture (flat, or the card's no-signal slate) and no sound for this long
+/// aren't a signal: the Elgato 4K S keeps sending those with nothing on the input. Long enough for any loading
+/// screen seen in recorded play (0.8 s of flat picture at most), short of annoying.
+const BLANK_AFTER: Duration = Duration::from_secs(20);
 /// A Passthru left running in the tray looks for updates this often (the check itself is
 /// throttled to about daily).
-const UPDATE_EVERY: Duration = Duration::from_secs(6 * 3600);
+pub(crate) const UPDATE_EVERY: Duration = Duration::from_secs(6 * 3600);
 
 /// Messages top right stay this long.
 const TOAST_FOR: Duration = Duration::from_millis(3000);
@@ -136,9 +142,8 @@ struct Viewer {
     toast: Option<(String, Instant)>,
     /// When the update check last started (one left running in the tray checks again).
     updater_at: Instant,
-    /// The window is on screen (not waiting in the tray), and has been at least once.
+    /// The window is on screen (false only while handing over to the tray, or if that failed).
     window_shown: bool,
-    placed: bool,
     /// The main window is fullscreen (the controls' window can't tell).
     fullscreen: bool,
     /// The controls' window has something on it (else it needn't redraw).
@@ -282,6 +287,15 @@ impl Viewer {
 
     /// Polls the pointer: shows the controls while it moves over the window, hides them (and
     /// the cursor, in fullscreen) once it's been still a while.
+    /// Something is really on the input: frames, and a picture in them or sound with them
+    /// lately.
+    fn has_content(&self) -> bool {
+        let recent = |t: &Mutex<Option<Instant>>| t.lock().unwrap().is_some_and(|t| t.elapsed() < BLANK_AFTER);
+        self.has_signal()
+            && self.video.last_picture.lock().unwrap().is_some()
+            && (recent(&self.video.last_picture) || recent(&self.audio.last_sound))
+    }
+
     /// More than a few seconds since start (the GPU path may never come: `--cpu`).
     fn started_long_ago(&self) -> bool {
         self.stats.started.elapsed() > Duration::from_secs(5)
@@ -378,6 +392,15 @@ impl Viewer {
         if !self.window_shown {
             return;
         }
+        // Minimised there's nothing to draw for (the sound keeps playing), and Present would
+        // only wait on a window Windows isn't composing.
+        if let Some(h) = self.hwnd {
+            let minimised = winutil::minimised(h);
+            self.video.gpu.paused.store(minimised, Ordering::Relaxed);
+            if minimised {
+                return;
+            }
+        }
         if window.is_fullscreen() != self.fullscreen {
             self.fullscreen = !self.fullscreen;
             cx.notify();
@@ -446,17 +469,13 @@ impl Viewer {
         }
     }
 
-    /// Opens the window when a signal arrives and closes it once the signal has been gone a
-    /// while, as the settings menu says.
+    /// Closes the window once the signal has been gone a while, as the settings menu says
+    /// (opening on one is the tray's: tray.rs).
     fn tick_signal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let signal = self.has_signal();
+        let signal = self.has_content();
         if signal != self.signal_on {
             self.signal_on = signal;
             self.signal_lost_at = (!signal).then(Instant::now);
-            if signal && !self.window_shown && self.settings.open_on_signal {
-                log::line("signal: arrived, opening the window");
-                self.show_window(window, cx);
-            }
         }
         if self.window_shown
             && self.settings.close_on_signal_loss
@@ -482,11 +501,7 @@ impl Viewer {
         self.window_shown = true;
         self.video.gpu.paused.store(false, Ordering::Relaxed);
         self.audio.muted.store(self.settings.muted, Ordering::Relaxed);
-        // Started hidden, the window's first showing is gpui's (activate_window puts it where
-        // it was last); after that it's shown here.
-        if std::mem::replace(&mut self.placed, true) {
-            winutil::set_shown(h, true);
-        }
+        winutil::set_shown(h, true);
         if was_hidden {
             self.signal_lost_at = None;
             if self.settings.start_fullscreen && !window.is_fullscreen() {
@@ -513,8 +528,20 @@ impl Viewer {
         self.video.gpu.paused.store(true, Ordering::Relaxed);
         self.audio.muted.store(true, Ordering::Relaxed);
         winutil::set_shown(h, false);
-        self.sync_tray();
-        cx.notify();
+        // All of it goes: a fresh process waits in the tray at next to no cost (tray.rs).
+        match tray::hand_over(self.signal_on) {
+            Ok(()) => {
+                winutil::set_tray(h, false);
+                telemetry::stop();
+                cx.quit();
+            }
+            Err(e) => {
+                // Then this one waits, hidden and paused.
+                log::line(&format!("tray: {e:#}; waiting as it is"));
+                self.sync_tray();
+                cx.notify();
+            }
+        }
     }
 
     /// The close button, Alt+F4, a lost signal: to the tray while Passthru waits there, else
@@ -885,10 +912,11 @@ impl Viewer {
             update::State::Failed(e) => format!("Couldn't check: {}", e.chars().take(80).collect::<String>()),
         };
         let secs = CLOSE_AFTER_LOSS.as_secs();
+        let blank = BLANK_AFTER.as_secs() + secs;
         let loss_text = if s.stays_in_tray() {
-            format!("After {secs} s without one, back to the tray")
+            format!("To the tray after {secs} s without a signal, {blank} s of blank, silent picture")
         } else {
-            format!("After {secs} s without one, Passthru quits")
+            format!("Quits after {secs} s without a signal, {blank} s of blank, silent picture")
         };
         menu_panel("settings-menu", 320., max_height)
             .child(menu_header("WINDOW"))
@@ -1600,8 +1628,10 @@ struct Args {
     show_settings: bool,
     /// Debug: screenshots and recordings see the controls, this run (for screenshots of them).
     controls_in_capture: bool,
-    /// Start hidden, in the tray (how Start with Windows starts it).
+    /// Wait in the tray (how Start with Windows and closing to the tray start it).
     background: bool,
+    /// With `background`: closed with a picture on, so wait for the next one to arrive.
+    wait_for_change: bool,
     /// Started by a Passthru that's exiting (an update): wait for it rather than defer to it.
     restarted: bool,
     /// Start a test session as soon as the video is up.
@@ -1627,6 +1657,7 @@ fn parse_args() -> Args {
         show_settings: false,
         controls_in_capture: false,
         background: false,
+        wait_for_change: false,
         restarted: false,
         record: false,
         record_opts: telemetry::Options::default(),
@@ -1645,6 +1676,7 @@ fn parse_args() -> Args {
             "--show-settings" => a.show_settings = true,
             "--controls-in-capture" => a.controls_in_capture = true,
             "--background" => a.background = true,
+            "--wait-for-change" => a.wait_for_change = true,
             "--restarted" => a.restarted = true,
             // Test sessions (see telemetry.rs); R toggles one in the app too.
             // Developer mode (test sessions, R and B); `--record` implies it.
@@ -1800,8 +1832,15 @@ fn main() {
     // One at a time: if one's already running (in the tray, say), bring that one up instead.
     if !cfg!(debug_assertions) && !dev_build {
         let wait = if args.restarted { Duration::from_secs(10) } else { Duration::ZERO };
-        if !instance::claim(wait) && (args.background || instance::show_running() || !instance::claim(Duration::from_secs(3))) {
-            return;
+        if !instance::claim(wait) {
+            if args.background || instance::show_running() {
+                return;
+            }
+            // None to show yet: one is on its way out or in (closing to the tray, say).
+            if !instance::claim(Duration::from_secs(3)) {
+                instance::show_running();
+                return;
+            }
         }
     }
     log::start();
@@ -1809,6 +1848,38 @@ fn main() {
     if install::running_installed() {
         update::clean_up();
         install::refresh_registration();
+    }
+    if args.background {
+        // Nothing of the app exists yet, so waiting costs next to nothing; it starts below
+        // when it's opened.
+        let s = Settings::load();
+        if install::running_installed() && s.start_with_windows {
+            let _ = install::set_autostart(true);
+        }
+        let opts = tray::Options {
+            open_on_signal: s.open_on_signal,
+            wait_for_change: args.wait_for_change,
+            auto_update: s.auto_update,
+            device: args.video.device.clone(),
+            exit_after: args.exit_after,
+        };
+        match tray::wait(&opts) {
+            Ok(tray::Wake::Open) => {}
+            // A newer version was installed while this waited: open that one.
+            Ok(tray::Wake::OpenUpdated) => {
+                if update::restart().is_ok() {
+                    return;
+                }
+            }
+            Ok(tray::Wake::Quit) => return,
+            Ok(tray::Wake::Updated) => {
+                if let Err(e) = tray::hand_over(args.wait_for_change) {
+                    log::line(&format!("tray: {e:#}"));
+                }
+                return;
+            }
+            Err(e) => log::line(&format!("tray: {e:#}; opening instead")),
+        }
     }
     let mut settings = Settings::load();
     if install::running_installed() && settings.start_with_windows {
@@ -1830,6 +1901,7 @@ fn main() {
         status: Mutex::new(String::new()),
         mode: Mutex::new(String::new()),
         last_frame: Mutex::new(None),
+        last_picture: Mutex::new(None),
         aspect: AtomicU32::new((16.0f32 / 9.0).to_bits()),
         hdr: AtomicBool::new(settings.hdr),
         display_w: AtomicU32::new(0),
@@ -1848,9 +1920,8 @@ fn main() {
     let (stats_enabled, exit_after, start_fullscreen) = (args.stats, args.exit_after, args.fullscreen);
     let (force_on_top, cpu_only, capture) = (args.on_top, args.cpu, args.capture.clone());
     let (show_menu, show_settings) = (args.show_menu, args.show_settings);
-    let start_hidden = args.background;
     let controls_in_capture = args.controls_in_capture;
-    let start_fullscreen = (start_fullscreen || settings.start_fullscreen) && !start_hidden;
+    let start_fullscreen = start_fullscreen || settings.start_fullscreen;
     let (record_now, record_opts) = (args.record, args.record_opts.clone());
 
     Application::new().run(move |cx: &mut App| {
@@ -1872,8 +1943,6 @@ fn main() {
             window_min_size: Some(size(px(320.), px(180.))),
             window_background: WindowBackgroundAppearance::Opaque,
             app_id: Some("passthru".into()),
-            show: !start_hidden,
-            focus: !start_hidden,
             ..Default::default()
         };
         let main_window = cx.open_window(options, |window, cx| {
@@ -1980,8 +2049,7 @@ fn main() {
                     },
                     show_menu: show_menu || show_settings,
                     updater_at: Instant::now(),
-                    window_shown: !start_hidden,
-                    placed: !start_hidden,
+                    window_shown: true,
                     signal_on: false,
                     signal_lost_at: None,
                     fullscreen: false,
@@ -1992,13 +2060,7 @@ fn main() {
                     slider_bounds: Rc::new(Cell::new(None)),
                 }
             });
-            view.update(cx, |v, _| {
-                if start_hidden {
-                    v.video.gpu.paused.store(true, Ordering::Relaxed);
-                    v.audio.muted.store(true, Ordering::Relaxed);
-                }
-                v.sync_tray();
-            });
+            view.update(cx, |v, _| v.sync_tray());
             // Alt+F4 and friends: to the tray while Passthru waits there, else remember where
             // the window was and quit.
             let weak = view.downgrade();
@@ -2024,9 +2086,7 @@ fn main() {
             open_controls_window(viewer, controls_in_capture, cx);
         }
         cx.on_window_closed(|cx| cx.quit()).detach();
-        if !start_hidden {
-            cx.activate(true);
-        }
+        cx.activate(true);
     });
     telemetry::stop();
 }

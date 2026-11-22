@@ -34,7 +34,12 @@ pub struct AudioShared {
     pub volume: AtomicU32,
     pub muted: AtomicBool,
     pub status: Mutex<String>,
+    /// When the input last carried sound (not silence).
+    pub last_sound: Mutex<Option<Instant>>,
 }
+
+/// Quieter than this (-60 dB) is silence.
+const SILENCE: f32 = 0.001;
 
 impl AudioShared {
     pub fn new(volume: f32, muted: bool) -> Arc<Self> {
@@ -45,6 +50,7 @@ impl AudioShared {
             generation: AtomicU32::new(0),
             volume: AtomicU32::new(volume.to_bits()),
             muted: AtomicBool::new(muted),
+            last_sound: Mutex::new(None),
             status: Mutex::new(String::new()),
         })
     }
@@ -378,6 +384,9 @@ fn run_capture(shared: &AudioShared, wanted: Option<&str>) -> Result<()> {
             }
             unsafe { capture.ReleaseBuffer(frames)? };
             shared.packet.fetch_max(frames as usize, Ordering::Relaxed);
+            if scratch.iter().any(|v| v.abs() > SILENCE) {
+                *shared.last_sound.lock().unwrap() = Some(Instant::now());
+            }
             let mut q = shared.queue.lock().unwrap();
             q.extend(scratch.iter().copied());
             if q.len() > cap {

@@ -30,6 +30,9 @@ pub struct VideoShared {
     /// Short description of the current mode for the controls, like "1440p60".
     pub mode: Mutex<String>,
     pub last_frame: Mutex<Option<Instant>>,
+    /// When a frame last had a picture in it. Frames alone don't mean a signal: the Elgato
+    /// 4K S keeps sending them with nothing on its input (black, then a slate: no_signal.rs).
+    pub last_picture: Mutex<Option<Instant>>,
     /// Width / height of the incoming video, as f32 bits.
     pub aspect: std::sync::atomic::AtomicU32,
     /// Decode the signal as HDR10 (PQ, BT.2020) and tone map it.
@@ -376,6 +379,163 @@ fn describe(t: &IMFMediaType) -> Option<(u32, u32, f64, GUID)> {
 
 const VIDEO_STREAM: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
 
+/// A frame is checked for a picture this often.
+const PICTURE_EVERY: u64 = 8;
+/// Luma differing by more than this anywhere in a frame is a picture.
+const FLAT: u8 = 2;
+
+/// Whether any of `rows` has anything but one flat level, looking at every `step`th byte of
+/// each (early out: a real picture answers within a few pixels).
+fn varies<'a>(rows: impl Iterator<Item = &'a [u8]>, step: usize) -> bool {
+    let (mut lo, mut hi) = (u8::MAX, u8::MIN);
+    for row in rows {
+        for &v in row.iter().step_by(step) {
+            (lo, hi) = (lo.min(v), hi.max(v));
+            if hi - lo > FLAT {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether `sample` has a picture in it: not flat (looking at some 240 rows of about 320
+/// pixels) and not the card's no-signal slate.
+fn has_picture(sample: &IMFSample, fmt: &Format) -> Result<bool> {
+    let buffer = unsafe {
+        if sample.GetBufferCount()? == 1 { sample.GetBufferByIndex(0)? } else { sample.ConvertToContiguousBuffer()? }
+    };
+    let locked = Locked::new(buffer)?;
+    let (bytes, offset) = match fmt.layout {
+        Layout::Nv12 => (1, 0),
+        Layout::Yuy2 => (2, 0),
+        // Green stands in for luma.
+        Layout::Rgb32 => (4, 1),
+    };
+    let (w, h) = (fmt.width, fmt.height);
+    let pitch = if locked.pitch != 0 { locked.pitch.unsigned_abs() } else { w * bytes };
+    // With rows bottom-up the rows still lie back to back, from the buffer's start.
+    let first = if locked.pitch < 0 { 0 } else { locked.scan0 as usize - locked.base as usize };
+    let data = locked.bytes();
+    let rows = (0..h).step_by((h / 240).max(1)).filter_map(|r| {
+        let at = first + r * pitch;
+        data.get(at + offset..at + w * bytes)
+    });
+    if !varies(rows, (w / 320).max(1) * bytes) {
+        return Ok(false);
+    }
+    // The last row's last byte has to be there for the slate's look at it.
+    if data.len() < first + (h - 1) * pitch + w * bytes {
+        return Ok(true);
+    }
+    Ok(!crate::no_signal::is_slate(w, h, |x, y| data[first + y * pitch + x * bytes + offset]))
+}
+
+/// The cheapest mode to glance at the input in: least data a second, in a format we read.
+fn cheapest_mode(modes: &[Mode]) -> Option<Mode> {
+    let readable = modes.iter().any(|m| subtype_rank(&m.subtype) > 1);
+    modes
+        .iter()
+        .filter(|m| m.fps > 0.0 && (!readable || subtype_rank(&m.subtype) > 1))
+        .min_by_key(|m| ((m.width * m.height) as f64 * m.fps) as u64)
+        .cloned()
+}
+
+/// From the tray's glances at the input: when a picture has arrived.
+struct Arrival {
+    /// The input has been without a picture since the watch began (or didn't need to be).
+    armed: bool,
+    seen: u32,
+    missing: u32,
+}
+
+impl Arrival {
+    /// Glances in a row it takes to believe a picture.
+    const SURE: u32 = 2;
+    /// And that it's gone, when it was there at closing: longer than a black loading screen, or
+    /// the black while the card switches to the watching mode.
+    const GONE: u32 = 15;
+
+    fn new(wait_for_change: bool) -> Self {
+        Arrival { armed: !wait_for_change, seen: 0, missing: 0 }
+    }
+
+    /// Takes one glance; true once a picture has arrived.
+    fn glance(&mut self, picture: bool) -> bool {
+        if picture {
+            self.seen += 1;
+            self.missing = 0;
+        } else {
+            self.missing += 1;
+            self.seen = 0;
+            self.armed |= self.missing >= Self::GONE;
+        }
+        self.armed && self.seen >= Self::SURE
+    }
+}
+
+/// The tray looks at the input this often.
+const GLANCE_EVERY: Duration = Duration::from_secs(1);
+/// And tries a card that wouldn't open (unplugged, or another program has it) this often.
+const RETRY_EVERY: Duration = Duration::from_secs(15);
+
+/// For the tray: watches the card as cheaply as it can be until a picture arrives (true) or
+/// `stop` says to leave (false). Closed with a picture on (`wait_for_change`), only one that
+/// comes after that picture has gone counts.
+pub fn watch_picture(device: Option<&str>, wait_for_change: bool, stop: &std::sync::mpsc::Receiver<()>) -> bool {
+    use std::sync::mpsc::RecvTimeoutError::Timeout;
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        if let Err(e) = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET) {
+            crate::log::line(&format!("tray: Media Foundation failed: {e}"));
+            return false;
+        }
+    }
+    let mut arrival = Arrival::new(wait_for_change);
+    let mut complaint = String::new();
+    loop {
+        let watched = (|| -> Result<Option<bool>> {
+            let mut o = open_mode(device, cheapest_mode)?;
+            let m = &o.mode;
+            crate::log::line(&format!("tray: watching {} at {}", o.name, mode_label(m.width, m.height, m.fps.round() as u32)));
+            // The first frames after opening can be left over from before.
+            for _ in 0..3 {
+                read(&mut o, None, Duration::from_secs(1))?;
+            }
+            loop {
+                if stop.recv_timeout(GLANCE_EVERY) != Err(Timeout) {
+                    return Ok(Some(false));
+                }
+                let picture = match read(&mut o, None, Duration::from_millis(500))? {
+                    Read::Frame(s) => has_picture(&s, &o.fmt)?,
+                    Read::Nothing | Read::Stalled => false,
+                    // The input changed: look again in what it offers now.
+                    Read::ModeChanged(_) | Read::Reopen => return Ok(None),
+                };
+                if arrival.glance(picture) {
+                    crate::log::line("tray: a picture arrived");
+                    return Ok(Some(true));
+                }
+            }
+        })();
+        let pause = match watched {
+            Ok(Some(arrived)) => return arrived,
+            Ok(None) => GLANCE_EVERY,
+            Err(e) => {
+                let text = format!("tray: can't watch the card: {e:#}");
+                if text != complaint {
+                    crate::log::line(&text);
+                    complaint = text;
+                }
+                RETRY_EVERY
+            }
+        };
+        if stop.recv_timeout(pause) != Err(Timeout) {
+            return false;
+        }
+    }
+}
+
 /// Prints every capture device and its modes (for `--list`).
 pub fn list() -> Result<()> {
     unsafe {
@@ -689,8 +849,12 @@ struct Opened {
 }
 
 fn open_configured(opts: &VideoOptions, wanted: Option<ModeKey>) -> Result<Opened> {
+    open_mode(opts.device.as_deref(), |modes| choose_mode(modes, wanted))
+}
+
+fn open_mode(name: Option<&str>, choose: impl FnOnce(&[Mode]) -> Option<Mode>) -> Result<Opened> {
     let devices = enumerate_devices()?;
-    let Some(device) = pick_device(devices, opts.device.as_deref()) else {
+    let Some(device) = pick_device(devices, name) else {
         bail!("No capture device found");
     };
     let (tx, samples) = std::sync::mpsc::channel();
@@ -698,7 +862,7 @@ fn open_configured(opts: &VideoOptions, wanted: Option<ModeKey>) -> Result<Opene
     let (reader, source) = open_reader(&device, Some(&callback))?;
     let shutdown = Shutdown(source);
     let modes = native_modes(&reader);
-    let Some(mode) = choose_mode(&modes, wanted) else {
+    let Some(mode) = choose(&modes) else {
         bail!("{}: no matching video mode", device.name);
     };
     unsafe {
@@ -865,6 +1029,9 @@ fn run(
             if guess != before && let Some(full) = guess {
                 crate::log::line(&format!("video: the picture looks {} range", if full { "full" } else { "limited" }));
             }
+        }
+        if frames % PICTURE_EVERY == 0 && has_picture(&sample, &o.fmt)? {
+            *shared.last_picture.lock().unwrap() = Some(Instant::now());
         }
         frames += 1;
         had_frames = true;
@@ -1046,6 +1213,7 @@ fn test_pattern(shared: &VideoShared, presenter: &Presenter, rates: (u32, u32, b
             std::thread::sleep(wait);
         }
         buf.copy_from_slice(&base);
+        *shared.last_picture.lock().unwrap() = Some(Instant::now());
         // A white bar moving one bar-width per picture, so dropped frames show as jumps.
         let bar = 64;
         let picture = test_picture(n, fps, content, hitch);
@@ -1353,6 +1521,35 @@ pub fn snapshot(opts: &VideoOptions, dir: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flat_frames_are_not_a_picture() {
+        let no_input = [17u8; 320];
+        let mut logo = no_input;
+        logo[160] = 200;
+        assert!(!varies([&no_input[..]; 4].into_iter(), 1));
+        assert!(!varies([&[16u8, 17, 18, 17][..]].into_iter(), 1), "within the card's noise");
+        assert!(varies([&no_input[..], &logo[..]].into_iter(), 1));
+    }
+
+    #[test]
+    fn the_tray_opens_when_a_picture_arrives() {
+        // Started with Windows: a console that's already on opens it.
+        let mut a = Arrival::new(false);
+        assert!(!a.glance(true));
+        assert!(a.glance(true));
+        // A single odd frame doesn't.
+        let mut a = Arrival::new(false);
+        assert!(!a.glance(true) && !a.glance(false) && !a.glance(true));
+        // Closed while playing: stays closed until the console has been off and comes back.
+        let mut a = Arrival::new(true);
+        assert!((0..10).all(|_| !a.glance(true)));
+        assert!((1..Arrival::GONE).all(|_| !a.glance(false)), "not gone yet");
+        assert!(!a.glance(true) && !a.glance(true), "a black screen in the game isn't off");
+        assert!((0..Arrival::GONE).all(|_| !a.glance(false)));
+        assert!(!a.glance(true));
+        assert!(a.glance(true));
+    }
 
     fn mode(width: u32, height: u32, fps: f64, subtype: GUID) -> Mode {
         Mode { index: 0, width, height, fps, subtype }
