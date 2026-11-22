@@ -535,7 +535,7 @@ void flow_snap(uint3 id : SV_DispatchThreadID) {
 // window (level-0 pixels, sampled 5 apart) is hidden, ramping over HIDDEN_RAMP, nothing
 // matched at all (a screen changing in place), so blend.
 #define HIDDEN_STEP 5
-#define HIDDEN_START 0.7
+#define HIDDEN_START 0.85
 #define HIDDEN_RAMP 0.2
 // Levels of difference between A and B (unmoved) for a level-0 pixel to count as changed.
 #define CHANGED 4.0
