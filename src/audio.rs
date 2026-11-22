@@ -1,6 +1,8 @@
 //! Audio passthrough: WASAPI capture from the card's endpoint into a small queue, WASAPI render
 //! from it to the default output. Both sides run event-driven at the smallest period the engine
-//! allows, and the render side trims or re-buffers the queue so it never builds up latency.
+//! allows. The render side is woken by both: sound goes into the device's buffer the moment it
+//! arrives, so one margin covers the jitter of both sides, and it's trimmed (or grown, if it ran
+//! out) so latency never builds up.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -19,7 +21,7 @@ use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, STGM_READ,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject};
 use windows::core::Interface;
 
 pub struct AudioShared {
@@ -36,6 +38,8 @@ pub struct AudioShared {
     pub status: Mutex<String>,
     /// When the input last carried sound (not silence).
     pub last_sound: Mutex<Option<Instant>>,
+    /// Set as sound arrives in the queue (an event handle).
+    arrived: isize,
 }
 
 /// Quieter than this (-60 dB) is silence.
@@ -51,6 +55,7 @@ impl AudioShared {
             volume: AtomicU32::new(volume.to_bits()),
             muted: AtomicBool::new(muted),
             last_sound: Mutex::new(None),
+            arrived: unsafe { CreateEventW(None, false, false, None) }.expect("create an event").0 as isize,
             status: Mutex::new(String::new()),
         })
     }
@@ -393,19 +398,63 @@ fn run_capture(shared: &AudioShared, wanted: Option<&str>) -> Result<()> {
                 let excess = q.len() - cap / 4;
                 q.drain(..excess & !1);
             }
+            drop(q);
+            unsafe {
+                let _ = SetEvent(HANDLE(shared.arrived as _));
+            }
         }
     }
 }
 
-/// Keeps the queue as short as the capture side's packet timing allows.
+/// The margin (how late a packet from the card may come without a gap): at first, what running
+/// dry adds to it, and the most it grows to.
+const MARGIN_MS: usize = 6;
+const MARGIN_STEP_MS: usize = 1;
+const MARGIN_MOST_MS: usize = 30;
+/// A margin that grew comes back a step after this long without running dry (one busy moment
+/// mustn't mean more delay for the rest of the session).
+const MARGIN_BACK: Duration = Duration::from_secs(600);
+/// Too little is put right after this long, too much only after this long of it.
+const ADD_AFTER: Duration = Duration::from_millis(500);
+const SHED_AFTER: Duration = Duration::from_secs(5);
+
+/// Adjusting changes the speed by this fraction at most: 2%, half a second for a 10 ms period,
+/// as the two clocks drift past each other now and then.
+const ADJUST_ONE_IN: usize = 48;
+
+/// How much to have buffered as a packet lands, not counting it, for the next to be allowed
+/// `margin` late: `ahead` is until the engine next takes a `period` (all in frames).
+///
+/// The engine takes whole periods, so between those more buys nothing but delay: the least is
+/// whole periods and `guard`, for the clocks' drift.
+fn needed(ahead: usize, margin: usize, period: usize, guard: usize) -> usize {
+    margin.saturating_sub(ahead).div_ceil(period) * period + guard
+}
+
+/// Keeps what's buffered as short as both sides' timing allows.
 struct Jitter {
-    /// Safety margin above one capture packet, in frames. Grows on underrun.
+    /// How late a packet may come, in frames. Grows when the output runs dry.
     margin: usize,
-    trough: usize,
+    /// The least more than needed that was buffered as a packet landed, lately (negative: too
+    /// little), and since the last time too much was checked.
+    least: isize,
+    least_long: isize,
     window: Instant,
-    /// Frames to skip to shed accumulated latency (clock drift, startup bursts).
-    shed: usize,
+    long_window: Instant,
+    /// Frames still to skip (too much buffered: clock drift, start-up bursts) or to add (too
+    /// little).
+    adjust: isize,
     prefilling: bool,
+}
+
+impl Jitter {
+    fn restart_windows(&mut self) {
+        self.least = isize::MAX;
+        self.least_long = isize::MAX;
+        self.window = Instant::now();
+        self.long_window = self.window;
+        self.adjust = 0;
+    }
 }
 
 fn run_render(shared: &AudioShared) -> Result<()> {
@@ -436,28 +485,40 @@ fn run_render(shared: &AudioShared) -> Result<()> {
         stream.buffer_frames
     );
     let ms = |m: usize| rate as usize * m / 1000;
+    let period = (stream.period_frames as usize).max(1);
+    let guard = ms(1);
     let mut jit = Jitter {
-        margin: ms(2),
-        trough: usize::MAX,
+        margin: ms(MARGIN_MS),
+        least: isize::MAX,
+        least_long: isize::MAX,
         window: Instant::now(),
-        shed: 0,
+        long_window: Instant::now(),
+        adjust: 0,
         prefilling: true,
     };
     let mut gain = 0.0f32;
+    // Queued still after the last write (the device's buffer was full).
+    let mut carried = 0usize;
+    let mut engine_at = Instant::now();
+    // In the device's buffer after the last look and write.
+    let mut held = 0usize;
     let mut last_check = Instant::now();
-    // How full to keep the device's buffer: a period (what the engine takes per wake-up) and a
-    // little for a late wake-up. Filling all of it (1056 frames on a 480-frame period) kept
-    // 22 ms queued in the device for no reason; this keeps 14.
-    let keep = (stream.period_frames as usize + ms(4)).min(stream.buffer_frames as usize);
+    let mut grown_at = Instant::now();
     let mut dry = 0u32;
     let mut dry_logged = Instant::now();
+    let wakes = [stream.event, HANDLE(shared.arrived as _)];
     unsafe { stream.client.Start()? };
 
     loop {
-        unsafe { WaitForSingleObject(stream.event, 100) };
+        let woke = unsafe { WaitForMultipleObjects(&wakes, false, 100) };
+        let now = Instant::now();
+        if woke == WAIT_OBJECT_0 {
+            // The engine has just taken a period.
+            engine_at = now;
+        }
 
         if last_check.elapsed() >= Duration::from_millis(500) {
-            last_check = Instant::now();
+            last_check = now;
             // Follow default-device and capture changes by reopening.
             if shared.generation.load(Ordering::Acquire) != generation {
                 return Ok(());
@@ -468,75 +529,115 @@ fn run_render(shared: &AudioShared) -> Result<()> {
                 return Ok(());
             }
         }
-
-        let padding = unsafe { stream.client.GetCurrentPadding()? };
-        if padding == 0 && !jit.prefilling {
-            dry += 1;
-        }
         if dry > 0 && dry_logged.elapsed() >= Duration::from_secs(60) {
-            crate::log::line(&format!("audio: the output ran dry {dry} times in the last minute"));
+            crate::log::line(&format!(
+                "audio: the output ran dry {dry} times in the last minute (margin now {} ms)",
+                jit.margin * 1000 / rate as usize
+            ));
             dry = 0;
-            dry_logged = Instant::now();
+            dry_logged = now;
         }
-        let avail = keep.saturating_sub(padding as usize);
-        if avail == 0 {
+
+        let padding = unsafe { stream.client.GetCurrentPadding()? } as usize;
+        // Also when its event isn't here yet: the card's packets can land in the same instant
+        // (both follow the audio engine's clock).
+        if padding + period / 2 <= held {
+            engine_at = now;
+        }
+        held = padding;
+        let mut q = shared.queue.lock().unwrap();
+        let mut queued = q.len() / 2;
+        if jit.prefilling {
+            let start = period + jit.margin;
+            if padding + queued < start {
+                carried = queued;
+                continue;
+            }
+            // Whatever piled up while starting is old sound: only the newest is played.
+            let old = (padding + queued - start).min(queued);
+            q.drain(..old * 2);
+            queued -= old;
+            jit.prefilling = false;
+            jit.restart_windows();
+        } else if padding + carried == 0 {
+            // Ran out (the device plays silence meanwhile): a little more margin from here.
+            dry += 1;
+            jit.prefilling = true;
+            jit.margin = (jit.margin + ms(MARGIN_STEP_MS)).min(ms(MARGIN_MOST_MS));
+            grown_at = now;
+            if padding + queued < period + jit.margin {
+                carried = queued;
+                continue;
+            }
+            jit.prefilling = false;
+            jit.restart_windows();
+        } else if queued > carried {
+            // A packet landed: how much there was without it, against what that has to be.
+            let since = (now.saturating_duration_since(engine_at).as_secs_f64() * rate as f64) as usize;
+            let ahead = period.saturating_sub(since);
+            let have = (padding + carried) as isize;
+            jit.least = jit.least.min(have - needed(ahead, jit.margin, period, guard) as isize);
+            // Shedding wants a little over the margin, not to be added straight back.
+            jit.least_long = jit.least_long.min(have - needed(ahead, jit.margin + guard, period, guard) as isize);
+            if now.saturating_duration_since(jit.window) >= ADD_AFTER {
+                if jit.least < -(guard as isize) / 2 {
+                    let short = jit.least;
+                    jit.restart_windows();
+                    jit.adjust = -short;
+                } else {
+                    jit.least = isize::MAX;
+                    jit.window = now;
+                    if now.saturating_duration_since(jit.long_window) >= SHED_AFTER {
+                        let extra = jit.least_long;
+                        jit.restart_windows();
+                        if extra > guard as isize {
+                            jit.adjust = -extra;
+                        }
+                    }
+                }
+            }
+            if jit.margin > ms(MARGIN_MS) && grown_at.elapsed() >= MARGIN_BACK {
+                jit.margin = jit.margin.saturating_sub(ms(MARGIN_STEP_MS)).max(ms(MARGIN_MS));
+                grown_at = now;
+            }
+        }
+
+        // While adjusting one frame in `ADJUST_ONE_IN` is played twice or skipped.
+        let space = (stream.buffer_frames as usize).saturating_sub(padding);
+        let some = (queued / ADJUST_ONE_IN) as isize;
+        let change = jit.adjust.clamp(-some, some);
+        let write = ((queued as isize + change) as usize).min(space);
+        if write == 0 {
+            carried = queued;
             continue;
         }
-        let data = unsafe { render.GetBuffer(avail as u32)? };
-
+        let data = unsafe { render.GetBuffer(write as u32)? };
         let vol = shared.volume();
         let target = if shared.muted.load(Ordering::Relaxed) { 0.0 } else { vol * vol };
-        let step = (target - gain) / avail as f32;
-
-        let packet = shared.packet.load(Ordering::Relaxed);
-        let mut q = shared.queue.lock().unwrap();
-        let frames_queued = q.len() / 2;
-        if jit.prefilling && frames_queued >= packet + jit.margin {
-            jit.prefilling = false;
-            jit.trough = usize::MAX;
-            jit.window = Instant::now();
-        }
-        let mut underrun = false;
-        for i in 0..avail {
-            let (mut l, mut r) = (0.0f32, 0.0f32);
-            if !jit.prefilling {
-                // Skip one frame in 16 while shedding: a ~6% speed-up for a few ms, inaudible.
-                if jit.shed > 0 && i % 16 == 0 && q.len() >= 4 {
-                    q.drain(..2);
-                    jit.shed -= 1;
-                }
-                match (q.pop_front(), q.pop_front()) {
-                    (Some(a), Some(b)) => (l, r) = (a, b),
-                    _ => underrun = true,
-                }
+        let step = (target - gain) / write as f32;
+        let mut changed = 0isize;
+        let mut sample = (0.0f32, 0.0f32);
+        for i in 0..write {
+            let due = changed != change && i % (ADJUST_ONE_IN - 1) == ADJUST_ONE_IN - 2;
+            if due && change < 0 && q.len() >= 4 {
+                q.drain(..2);
+                changed -= 1;
+            }
+            if due && change > 0 {
+                // The last one again.
+                changed += 1;
+            } else {
+                sample = (q.pop_front().unwrap_or(0.0), q.pop_front().unwrap_or(0.0));
             }
             gain += step;
-            l *= gain;
-            r *= gain;
-            write_frame(data, i, &stream, l, r);
+            write_frame(data, i, &stream, sample.0 * gain, sample.1 * gain);
         }
         gain = target;
-        let level = q.len() / 2;
+        jit.adjust -= changed;
+        carried = q.len() / 2;
+        held += write;
         drop(q);
-        unsafe { render.ReleaseBuffer(avail as u32, 0)? };
-
-        if underrun {
-            jit.prefilling = true;
-            jit.margin = (jit.margin + ms(1)).min(ms(30));
-            continue;
-        }
-        if !jit.prefilling {
-            jit.trough = jit.trough.min(level);
-            if jit.window.elapsed() >= Duration::from_millis(500) {
-                // The trough is what's left just before the next capture packet lands; anything
-                // above the margin there is pure latency, so shed it gradually.
-                if jit.trough != usize::MAX && jit.trough > jit.margin + ms(1) {
-                    jit.shed = jit.trough - jit.margin;
-                }
-                jit.trough = usize::MAX;
-                jit.window = Instant::now();
-            }
-        }
+        unsafe { render.ReleaseBuffer(write as u32, 0)? };
     }
 }
 
@@ -557,5 +658,23 @@ fn write_frame(data: *mut u8, i: usize, s: &Stream, l: f32, r: f32) {
                 *(data as *mut i16).add(i * ch + c) = (v.clamp(-1.0, 1.0) * 32767.0) as i16;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needed;
+
+    #[test]
+    fn buffers_whole_periods_for_the_margin() {
+        let (period, margin, guard) = (480, 288, 48);
+        // The packet lands 8 ms before the engine takes the next period: that's margin enough.
+        assert_eq!(needed(384, margin, period, guard), guard);
+        // Just before it does: a late one would miss that, so a period more.
+        assert_eq!(needed(10, margin, period, guard), period + guard);
+        // A margin longer than a period.
+        assert_eq!(needed(0, 960, period, guard), 2 * period + guard);
+        // A 3 ms engine under a 6 ms margin.
+        assert_eq!(needed(0, margin, 144, guard), 2 * 144 + guard);
     }
 }
