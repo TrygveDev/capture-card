@@ -711,8 +711,8 @@ pub enum RangeVote {
 /// full-range video labelled limited (the HD60 X does that with the PS5's SDR output) has its
 /// darks well below 16 and its whites well above 235. So: more than a sliver under 8 or over
 /// 245 is full range; nothing under 15 with a good share sitting at 16 is limited; anything
-/// else (mid-tones only) says nothing. Returns the vote and the shares outside 8-245 and at
-/// 15-17.
+/// else (mid-tones only, or nothing but black: the card's own with no input) says nothing.
+/// Returns the vote and the shares outside 8-245 and at 15-17.
 pub fn range_vote(y: &[u8], pitch: usize, step: usize, w: usize, h: usize) -> (RangeVote, f64, f64) {
     let (mut n, mut deep, mut low, mut black) = (0u64, 0u64, 0u64, 0u64);
     for r in (0..h).step_by(7) {
@@ -728,7 +728,7 @@ pub fn range_vote(y: &[u8], pitch: usize, step: usize, w: usize, h: usize) -> (R
     let share = |c: u64| c as f64 / n.max(1) as f64;
     let vote = if share(deep) > 0.002 {
         RangeVote::Full
-    } else if low == 0 && share(black) > 0.01 {
+    } else if low == 0 && share(black) > 0.01 && share(black) < 0.99 {
         RangeVote::Limited
     } else {
         RangeVote::Unsure
@@ -1613,6 +1613,8 @@ mod range_tests {
         assert_eq!(range_vote(&plane(w, h, 0.3, 16), w, 1, w, h).0, RangeVote::Limited);
         // Bright everywhere: no telling.
         assert_eq!(range_vote(&plane(w, h, 0.0, 0), w, 1, w, h).0, RangeVote::Unsure);
+        // Nor does nothing but black: the 4K S sends 17 with no input, whatever came before.
+        assert_eq!(range_vote(&plane(w, h, 1.0, 17), w, 1, w, h).0, RangeVote::Unsure);
     }
 
     #[test]
