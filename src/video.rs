@@ -292,6 +292,8 @@ enum Ended {
 struct Device {
     name: String,
     activate: IMFActivate,
+    /// Its symbolic link (which physical device it is: the sound side looks for the same one).
+    link: String,
 }
 
 fn enumerate_devices() -> Result<Vec<Device>> {
@@ -309,19 +311,18 @@ fn enumerate_devices() -> Result<Vec<Device>> {
         let mut out = Vec::new();
         for i in 0..count as usize {
             if let Some(activate) = (*list.add(i)).take() {
-                let mut name = PWSTR::null();
-                let mut len = 0u32;
-                let label = if activate
-                    .GetAllocatedString(&MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &mut name, &mut len)
-                    .is_ok()
-                {
-                    let s = name.to_string().unwrap_or_default();
-                    CoTaskMemFree(Some(name.0 as _));
-                    s
-                } else {
-                    String::from("?")
+                let string = |key: &GUID| {
+                    let mut value = PWSTR::null();
+                    let mut len = 0u32;
+                    activate.GetAllocatedString(key, &mut value, &mut len).ok().map(|()| {
+                        let s = value.to_string().unwrap_or_default();
+                        CoTaskMemFree(Some(value.0 as _));
+                        s
+                    })
                 };
-                out.push(Device { name: label, activate });
+                let label = string(&MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME).unwrap_or_else(|| String::from("?"));
+                let link = string(&MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK).unwrap_or_default();
+                out.push(Device { name: label, activate, link });
             }
         }
         CoTaskMemFree(Some(list as _));
@@ -857,6 +858,7 @@ fn open_mode(name: Option<&str>, choose: impl FnOnce(&[Mode]) -> Option<Mode>) -
     let Some(device) = pick_device(devices, name) else {
         bail!("No capture device found");
     };
+    crate::audio::set_card(&device.name, crate::devices::container_of_interface(&device.link));
     let (tx, samples) = std::sync::mpsc::channel();
     let callback: IMFSourceReaderCallback = ReadCallback { tx: Mutex::new(tx) }.into();
     let (reader, source) = open_reader(&device, Some(&callback))?;

@@ -35,6 +35,10 @@ pub struct Settings {
     pub hide_from_capture: bool,
     /// Show "Playing Passthru" in Discord, with the time played, while there's a picture.
     pub discord: bool,
+    /// The sound input and output picked in the menu (endpoint IDs); None picks automatically:
+    /// the card's own input, and Windows' default output.
+    pub audio_input: Option<String>,
+    pub audio_output: Option<String>,
     /// The signal's colour range: detected, or forced limited or full.
     pub range: crate::video::ColourRange,
     /// Last windowed position and size in logical pixels: x, y, width, height.
@@ -70,6 +74,8 @@ impl Default for Settings {
             start_with_windows: true,
             hide_from_capture: false,
             discord: true,
+            audio_input: None,
+            audio_output: None,
             range: crate::video::ColourRange::Auto,
             window: None,
             run_only: RunOnly::default(),

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::*;
@@ -40,13 +40,19 @@ pub struct AudioShared {
     pub last_sound: Mutex<Option<Instant>>,
     /// Set as sound arrives in the queue (an event handle).
     arrived: isize,
+    /// Sound devices picked in the menu (endpoint IDs; None picks automatically), bumped
+    /// `picks` when either changes, and what's in use: input and output names.
+    input: Mutex<Option<String>>,
+    output: Mutex<Option<String>>,
+    picks: AtomicU32,
+    pub using: Mutex<(String, String)>,
 }
 
 /// Quieter than this (-60 dB) is silence.
 const SILENCE: f32 = 0.001;
 
 impl AudioShared {
-    pub fn new(volume: f32, muted: bool) -> Arc<Self> {
+    pub fn new(volume: f32, muted: bool, input: Option<String>, output: Option<String>) -> Arc<Self> {
         Arc::new(AudioShared {
             queue: Mutex::new(VecDeque::with_capacity(48_000)),
             rate: AtomicU32::new(0),
@@ -57,7 +63,23 @@ impl AudioShared {
             last_sound: Mutex::new(None),
             arrived: unsafe { CreateEventW(None, false, false, None) }.expect("create an event").0 as isize,
             status: Mutex::new(String::new()),
+            input: Mutex::new(input),
+            output: Mutex::new(output),
+            picks: AtomicU32::new(0),
+            using: Mutex::new((String::new(), String::new())),
         })
+    }
+
+    /// The card's sound from this input (None: found automatically); taken up at once.
+    pub fn set_input(&self, id: Option<String>) {
+        *self.input.lock().unwrap() = id;
+        self.picks.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Played on this output (None: Windows' default); taken up at once.
+    pub fn set_output(&self, id: Option<String>) {
+        *self.output.lock().unwrap() = id;
+        self.picks.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn volume(&self) -> f32 {
@@ -76,6 +98,11 @@ pub fn spawn(shared: Arc<AudioShared>, device: Option<String>) {
         .spawn(move || {
             com_init();
             crate::raise_thread_priority("Pro Audio");
+            // The video says which device the card is: give it a moment to open one first.
+            let started = Instant::now();
+            while device.is_none() && CARD.lock().unwrap().is_none() && started.elapsed() < Duration::from_secs(3) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
             // Logged once per new error: a card that's unplugged fails every second.
             let mut last = String::new();
             loop {
@@ -154,6 +181,33 @@ fn device_id(device: &IMMDevice) -> String {
     }
 }
 
+/// A sound device for the menu: its endpoint ID and name.
+pub struct Endpoint {
+    pub id: String,
+    pub name: String,
+}
+
+/// The connected sound inputs (or outputs), for the menu.
+pub fn endpoints(inputs: bool) -> Vec<Endpoint> {
+    com_init();
+    let Ok(e) = enumerator() else { return Vec::new() };
+    let flow = if inputs { eCapture } else { eRender };
+    let Ok(col) = (unsafe { e.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE) }) else { return Vec::new() };
+    let count = unsafe { col.GetCount() }.unwrap_or(0);
+    let mut out: Vec<Endpoint> = (0..count)
+        .filter_map(|i| unsafe { col.Item(i) }.ok())
+        .map(|d| Endpoint { id: device_id(&d), name: friendly_name(&d) })
+        .collect();
+    out.sort_by_key(|d| d.name.to_lowercase());
+    out
+}
+
+/// The active device of `flow` with this endpoint ID.
+fn device_by_id(e: &IMMDeviceEnumerator, flow: EDataFlow, id: &str) -> Option<IMMDevice> {
+    let col = unsafe { e.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE) }.ok()?;
+    (0..unsafe { col.GetCount() }.ok()?).filter_map(|i| unsafe { col.Item(i) }.ok()).find(|d| device_id(d) == id)
+}
+
 /// Every capture endpoint, for `--list`.
 pub fn list() -> Result<()> {
     com_init();
@@ -168,25 +222,63 @@ pub fn list() -> Result<()> {
     Ok(())
 }
 
-fn find_capture(e: &IMMDeviceEnumerator, wanted: Option<&str>) -> Result<IMMDevice> {
+/// The video device Passthru opened: its name, and which physical device it is (devices.rs).
+static CARD: Mutex<Option<(String, Option<windows::core::GUID>)>> = Mutex::new(None);
+
+/// Called when the video opens a device: its sound is looked for on the same physical device.
+pub fn set_card(name: &str, container: Option<windows::core::GUID>) {
+    *CARD.lock().unwrap() = Some((name.to_string(), container));
+}
+
+/// The capture card's sound input, and how it was recognised (for the log). Best is the input
+/// on the same physical device as the video (any card, whatever its sound is called), then one
+/// named like the video device, then known card names.
+fn find_capture(e: &IMMDeviceEnumerator, wanted: Option<&str>) -> Result<(IMMDevice, &'static str)> {
+    let card = CARD.lock().unwrap().clone();
     let col = unsafe { e.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)? };
     let mut best: Option<(u8, IMMDevice)> = None;
+    let mut names = Vec::new();
     for i in 0..unsafe { col.GetCount()? } {
         let d = unsafe { col.Item(i)? };
-        let name = friendly_name(&d).to_lowercase();
+        let name = friendly_name(&d);
+        let lower = name.to_lowercase();
+        names.push(name);
         let score = match wanted {
-            Some(w) if name.contains(&w.to_lowercase()) => 3,
+            Some(w) if lower.contains(&w.to_lowercase()) => 5,
             Some(_) => 0,
-            None if name.contains("hd60") => 3,
-            None if name.contains("elgato") && !name.contains("virtual") => 2,
-            None => 0,
+            None => {
+                let same_device = card.as_ref().and_then(|(_, c)| *c).is_some_and(|c| {
+                    crate::devices::container_of_instance(&format!(r"SWD\MMDEVAPI\{}", device_id(&d))) == Some(c)
+                });
+                let video_name = card.as_ref().map(|(n, _)| n.to_lowercase()).filter(|n| n.len() >= 3);
+                if same_device {
+                    4
+                } else if video_name.is_some_and(|n| lower.contains(&n)) {
+                    3
+                } else if lower.contains("hd60") {
+                    2
+                } else if lower.contains("elgato") && !lower.contains("virtual") {
+                    1
+                } else {
+                    0
+                }
+            }
         };
         if score > 0 && best.as_ref().is_none_or(|(s, _)| score > *s) {
             best = Some((score, d));
         }
     }
-    best.map(|(_, d)| d)
-        .context("Capture card audio input not found")
+    let Some((score, device)) = best else {
+        let video = card.map_or_else(|| "none yet".to_string(), |(n, c)| format!("{n}{}", if c.is_some() { "" } else { ", device unknown" }));
+        bail!("Capture card audio input not found (video: {video}; inputs: {})", names.join(", "));
+    };
+    let how = match score {
+        5 => "as asked",
+        4 => "same device as the video",
+        3 => "named like the video",
+        _ => "by name",
+    };
+    Ok((device, how))
 }
 
 /// An initialised, event-driven shared-mode stream.
@@ -249,8 +341,9 @@ unsafe fn parse_format(f: *const WAVEFORMATEX) -> (u32, usize, bool, u16) {
 
 /// Opens `device` in shared mode. With `want_rate` set the stream must run at that rate (the
 /// engine resamples if the device doesn't); otherwise it runs at the device's own mix format.
-/// The device's mix format gets the low-latency IAudioClient3 path when the driver offers one.
-fn open_stream(device: &IMMDevice, want_rate: Option<u32>) -> Result<Stream> {
+/// The device's mix format gets the low-latency IAudioClient3 path when the driver offers one
+/// and `low_latency` allows it.
+fn open_stream(device: &IMMDevice, want_rate: Option<u32>, low_latency: bool) -> Result<Stream> {
     unsafe {
         let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
         let mix = client.GetMixFormat()?;
@@ -262,7 +355,7 @@ fn open_stream(device: &IMMDevice, want_rate: Option<u32>) -> Result<Stream> {
         let result = (|| -> Result<Stream> {
             if native {
                 // Smallest period the shared engine supports for this format.
-                if let Ok(c3) = client.cast::<IAudioClient3>() {
+                if let Some(c3) = low_latency.then(|| client.cast::<IAudioClient3>().ok()).flatten() {
                     let (mut def, mut fund, mut min, mut max) = (0, 0, 0, 0);
                     if c3
                         .GetSharedModeEnginePeriod(mix, &mut def, &mut fund, &mut min, &mut max)
@@ -357,12 +450,23 @@ fn read_frame(data: *const u8, i: usize, s: &Stream) -> (f32, f32) {
 
 fn run_capture(shared: &AudioShared, wanted: Option<&str>) -> Result<()> {
     let e = enumerator()?;
-    let device = find_capture(&e, wanted)?;
+    let picks = shared.picks.load(Ordering::Acquire);
+    let picked = shared.input.lock().unwrap().clone();
+    let found = picked.as_deref().and_then(|id| device_by_id(&e, eCapture, id));
+    // A picked input that isn't connected is looked for again now and then.
+    let missing = picked.is_some() && found.is_none();
+    let (device, how) = match found {
+        Some(d) => (d, "picked in the menu"),
+        None => {
+            let (d, how) = find_capture(&e, wanted)?;
+            (d, if picked.is_some() { "the one picked isn't connected" } else { how })
+        }
+    };
     let name = friendly_name(&device);
-    let stream = open_stream(&device, None)?;
+    let stream = open_stream(&device, None, true)?;
     let capture: IAudioCaptureClient = unsafe { stream.client.GetService()? };
     crate::log::line(&format!(
-        "audio in: {name}  {} Hz {}ch, {}, period {} frames ({:.2} ms)",
+        "audio in: {name} ({how})  {} Hz {}ch, {}, period {} frames ({:.2} ms)",
         stream.rate,
         stream.channels,
         stream.how,
@@ -374,12 +478,24 @@ fn run_capture(shared: &AudioShared, wanted: Option<&str>) -> Result<()> {
     shared.rate.store(stream.rate, Ordering::Release);
     shared.generation.fetch_add(1, Ordering::AcqRel);
     shared.status.lock().unwrap().clear();
+    shared.using.lock().unwrap().0 = name.clone();
     unsafe { stream.client.Start()? };
 
     // Keep at most this much queued if the output side stalls.
     let cap = stream.rate as usize / 5 * 2;
     let mut scratch: Vec<f32> = Vec::with_capacity(4096);
+    let mut looked = Instant::now();
     loop {
+        // Another input picked in the menu, or the picked one is back: reopen.
+        if shared.picks.load(Ordering::Acquire) != picks {
+            return Ok(());
+        }
+        if missing && looked.elapsed() >= Duration::from_secs(3) {
+            looked = Instant::now();
+            if picked.as_deref().and_then(|id| device_by_id(&e, eCapture, id)).is_some() {
+                return Ok(());
+            }
+        }
         if unsafe { WaitForSingleObject(stream.event, 500) } != WAIT_OBJECT_0 {
             continue;
         }
@@ -534,17 +650,29 @@ fn run_render(shared: &AudioShared) -> Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     };
     let generation = shared.generation.load(Ordering::Acquire);
+    let picks = shared.picks.load(Ordering::Acquire);
     let e = enumerator()?;
-    let device = unsafe { e.GetDefaultAudioEndpoint(eRender, eConsole)? };
+    // The output picked in the menu, else (or while it isn't connected) Windows' default.
+    let picked_id = shared.output.lock().unwrap().clone();
+    let picked = picked_id.as_deref().and_then(|id| device_by_id(&e, eRender, id));
+    let follows_default = picked.is_none();
+    let mut looked = Instant::now();
+    let device = match picked {
+        Some(d) => d,
+        None => unsafe { e.GetDefaultAudioEndpoint(eRender, eConsole)? },
+    };
     let id = device_id(&device);
-    let stream = open_stream(&device, Some(rate))?;
+    let stream = open_stream(&device, Some(rate), true)?;
     if stream.rate != rate {
         bail!("output opened at {} Hz, wanted {rate}", stream.rate);
     }
     let render: IAudioRenderClient = unsafe { stream.client.GetService()? };
+    let out_name = friendly_name(&device);
+    shared.using.lock().unwrap().1 = out_name.clone();
     crate::log::line(&format!(
-        "audio out: {}  {} Hz {}ch, {}, period {} frames ({:.2} ms), buffer {} frames",
-        friendly_name(&device),
+        "audio out: {} ({})  {} Hz {}ch, {}, period {} frames ({:.2} ms), buffer {} frames",
+        out_name,
+        if follows_default { "Windows' default" } else { "picked in the menu" },
         stream.rate,
         stream.channels,
         stream.how,
@@ -579,14 +707,22 @@ fn run_render(shared: &AudioShared) -> Result<()> {
 
         if last_check.elapsed() >= Duration::from_millis(500) {
             last_check = now;
-            // Follow default-device and capture changes by reopening.
-            if shared.generation.load(Ordering::Acquire) != generation {
+            // Follow default-device, capture and menu changes by reopening.
+            if shared.generation.load(Ordering::Acquire) != generation || shared.picks.load(Ordering::Acquire) != picks {
                 return Ok(());
             }
-            if let Ok(d) = unsafe { e.GetDefaultAudioEndpoint(eRender, eConsole) }
+            if follows_default
+                && let Ok(d) = unsafe { e.GetDefaultAudioEndpoint(eRender, eConsole) }
                 && device_id(&d) != id
             {
                 return Ok(());
+            }
+            // The picked output is connected again.
+            if follows_default && picked_id.is_some() && looked.elapsed() >= Duration::from_secs(3) {
+                looked = now;
+                if picked_id.as_deref().and_then(|i| device_by_id(&e, eRender, i)).is_some() {
+                    return Ok(());
+                }
             }
         }
         if dry > 0 && dry_logged.elapsed() >= Duration::from_secs(60) {

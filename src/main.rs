@@ -3,6 +3,7 @@
 mod app;
 mod audio;
 mod convert;
+mod devices;
 mod discord;
 mod gpu;
 mod gputest;
@@ -158,6 +159,10 @@ struct Viewer {
     /// The Discord status, and when its timer started (the picture arriving).
     discord: discord::Presence,
     discord_since: Option<u64>,
+    /// Sound inputs and outputs for the menu, read as it opens, and the devices in use it last
+    /// showed (it's redrawn when they change).
+    sound_devices: (Vec<audio::Endpoint>, Vec<audio::Endpoint>),
+    sound_seen: (String, String),
 }
 
 /// The controls' window: draws what `Viewer::render_controls` gives.
@@ -192,6 +197,8 @@ enum Menu {
     Mode,
     /// The window, the background, updates.
     Settings,
+    /// Where the sound comes from and plays.
+    Sound,
 }
 
 /// Frame-rate and latency counters, printed every few seconds with `--stats` (always in dev
@@ -394,6 +401,13 @@ impl Viewer {
             cx.notify();
         }
         self.tick_signal(window, cx);
+        if self.menu_open == Some(Menu::Sound) {
+            let using = self.audio.using.lock().unwrap().clone();
+            if using != self.sound_seen {
+                self.sound_seen = using;
+                cx.notify();
+            }
+        }
         if !self.window_shown {
             return;
         }
@@ -588,7 +602,65 @@ impl Viewer {
 
     fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
         self.menu_open = if self.menu_open == Some(menu) { None } else { Some(menu) };
+        if self.menu_open == Some(Menu::Sound) {
+            self.sound_devices = (audio::endpoints(true), audio::endpoints(false));
+        }
         cx.notify();
+    }
+
+    fn pick_audio_input(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        self.settings.audio_input = id.clone();
+        self.settings.save();
+        self.audio.set_input(id);
+        cx.notify();
+    }
+
+    fn pick_audio_output(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        self.settings.audio_output = id.clone();
+        self.settings.save();
+        self.audio.set_output(id);
+        cx.notify();
+    }
+
+    /// The sound menu: where the card's sound comes from, and where it plays.
+    fn sound_menu(&self, max_height: Pixels, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let mut menu = menu_panel("sound-menu", 400., max_height);
+        let (using_in, using_out) = self.audio.using.lock().unwrap().clone();
+        let lists = [
+            ("SOUND FROM", "Automatic", using_in, &self.sound_devices.0, &self.settings.audio_input, true),
+            ("SOUND TO", "Windows' default", using_out, &self.sound_devices.1, &self.settings.audio_output, false),
+        ];
+        for (header, auto_label, using, devices, picked, input) in lists {
+            if !input {
+                menu = menu.child(menu_rule());
+            }
+            menu = menu.child(menu_header(header));
+            let auto_detail = (picked.is_none() && !using.is_empty()).then(|| format!("Now: {using}"));
+            menu = menu.child(
+                menu_item((header, 0usize).into(), auto_label.into(), auto_detail, picked.is_none()).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        if input { this.pick_audio_input(None, cx) } else { this.pick_audio_output(None, cx) }
+                    },
+                )),
+            );
+            for (i, d) in devices.iter().enumerate() {
+                let id = d.id.clone();
+                menu = menu.child(
+                    menu_item((header, i + 1).into(), d.name.clone(), None, picked.as_deref() == Some(d.id.as_str())).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            if input { this.pick_audio_input(Some(id.clone()), cx) } else { this.pick_audio_output(Some(id.clone()), cx) }
+                        }),
+                    ),
+                );
+            }
+            if picked.as_ref().is_some_and(|p| !devices.iter().any(|d| &d.id == p)) {
+                menu = menu.child(menu_note(format!(
+                    "The one picked isn't connected, so {} is used until it is.",
+                    if input { "the card's own input" } else { "Windows' default" }
+                )));
+            }
+        }
+        menu
     }
 
     fn toggle_start_fullscreen(&mut self, cx: &mut Context<Self>) {
@@ -1270,6 +1342,7 @@ impl Viewer {
         let menu = match self.menu_open {
             Some(Menu::Mode) => Some(self.mode_menu(menu_room, cx)),
             Some(Menu::Settings) => Some(self.settings_menu(menu_room, cx)),
+            Some(Menu::Sound) => Some(self.sound_menu(menu_room, cx)),
             None => None,
         };
         // Slide in from below the window and back out, on a spring; settled, no more frames.
@@ -1337,6 +1410,26 @@ impl Viewer {
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(rgba(0xffffffcc))
                             .child(format!("{:.0}", volume * 100.0)),
+                    )
+                    // Opens the sound menu: the input and output.
+                    .child(
+                        div()
+                            .id("sound-menu-button")
+                            .w(px(20.))
+                            .h(px(24.))
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.))
+                            .cursor_pointer()
+                            .font_family(ICON_FONT)
+                            .text_size(px(9.))
+                            .text_color(rgba(0xffffffb3))
+                            .hover(|s| s.bg(rgba(0xffffff26)))
+                            .when(self.menu_open == Some(Menu::Sound), |d| d.bg(rgba(0xffffff26)))
+                            .child(ICON_CHEVRON_UP)
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(Menu::Sound, cx))),
                     )
                     .child(divider())
                     .child(hdr_button)
@@ -1633,6 +1726,7 @@ struct Args {
     show_menu: bool,
     /// Debug: the same with the settings menu open.
     show_settings: bool,
+    show_sound: bool,
     /// Debug: screenshots and recordings see the controls, this run (for screenshots of them).
     controls_in_capture: bool,
     /// Wait in the tray (how Start with Windows and closing to the tray start it).
@@ -1662,6 +1756,7 @@ fn parse_args() -> Args {
         capture: None,
         show_menu: false,
         show_settings: false,
+        show_sound: false,
         controls_in_capture: false,
         background: false,
         wait_for_change: false,
@@ -1681,6 +1776,7 @@ fn parse_args() -> Args {
             "--cpu" => a.cpu = true,
             "--show-menu" => a.show_menu = true,
             "--show-settings" => a.show_settings = true,
+            "--show-sound" => a.show_sound = true,
             "--controls-in-capture" => a.controls_in_capture = true,
             "--background" => a.background = true,
             "--wait-for-change" => a.wait_for_change = true,
@@ -1920,13 +2016,13 @@ fn main() {
     *video.control.wanted.lock().unwrap() = args.video.mode.or(settings.mode.map(|[w, h, f]| (w, h, f)));
     video.control.set_range(settings.range);
     video.meter.set_on(settings.overlay != Overlay::Off);
-    let audio = AudioShared::new(settings.volume, settings.muted);
+    let audio = AudioShared::new(settings.volume, settings.muted, settings.audio_input.clone(), settings.audio_output.clone());
     let updater = update::spawn(settings.auto_update, false);
     video::spawn(video.clone(), args.video);
     audio::spawn(audio.clone(), args.audio);
     let (stats_enabled, exit_after, start_fullscreen) = (args.stats, args.exit_after, args.fullscreen);
     let (force_on_top, cpu_only, capture) = (args.on_top, args.cpu, args.capture.clone());
-    let (show_menu, show_settings) = (args.show_menu, args.show_settings);
+    let (show_menu, show_settings, show_sound) = (args.show_menu, args.show_settings, args.show_sound);
     let controls_in_capture = args.controls_in_capture;
     let start_fullscreen = start_fullscreen || settings.start_fullscreen;
     let (record_now, record_opts) = (args.record, args.record_opts.clone());
@@ -2051,16 +2147,20 @@ fn main() {
                     dragging_volume: false,
                     menu_open: if show_settings {
                         Some(Menu::Settings)
+                    } else if show_sound {
+                        Some(Menu::Sound)
                     } else {
                         show_menu.then_some(Menu::Mode)
                     },
-                    show_menu: show_menu || show_settings,
+                    show_menu: show_menu || show_settings || show_sound,
                     updater_at: Instant::now(),
                     window_shown: true,
                     signal_on: false,
                     signal_lost_at: None,
                     discord: discord::Presence::spawn(),
                     discord_since: None,
+                    sound_devices: if show_sound { (audio::endpoints(true), audio::endpoints(false)) } else { Default::default() },
+                    sound_seen: Default::default(),
                     fullscreen: false,
                     controls_drawn: false,
                     requests,

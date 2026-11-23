@@ -43,6 +43,10 @@ app the first time (the exe isn't code-signed): *More info › Run anyway*.
   the controls and the pointer hide when the mouse is still. Always-on-top and fullscreen are one key away.
 - **Hidden from recordings** (in Settings): the controls stay out of screenshots, OBS and
   Discord (they see only the video), on Windows 10 2004 and later.
+- **Sound from any card**: the card's own sound input is found by being part of the same device
+  as its video, whatever either is called. The sound menu (the arrow beside the volume) picks
+  another input or output; Passthru plays the sound itself, so a Discord stream of its window
+  carries it.
 - **Discord status**: while there's a picture, Discord shows *Playing Passthru · On a console*
   with the time played (through the Discord app on the PC). Turn it off in Settings under
   *Show activity in Discord*.
