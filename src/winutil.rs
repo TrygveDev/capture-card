@@ -306,8 +306,15 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 do_follow(SET_WINDOW_POS_FLAGS(wparam.0 as u32));
                 return LRESULT(0);
             }
-            // Clicking the controls leaves the main window active (it has the keyboard).
-            WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+            // The controls' window is never the active one: a click on it makes the main window
+            // active instead (it has the keyboard and the taskbar button), as clicking the video does.
+            WM_MOUSEACTIVATE => {
+                let main = HWND(MAIN.load(Ordering::Relaxed) as _);
+                if GetForegroundWindow() != main {
+                    let _ = SetForegroundWindow(main);
+                }
+                return LRESULT(MA_NOACTIVATE as isize);
+            }
             // Nothing to size or frame: the client area is the whole window.
             WM_NCCALCSIZE if wparam.0 != 0 => return LRESULT(0),
             _ => {}
