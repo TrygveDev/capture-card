@@ -33,6 +33,8 @@ pub struct Settings {
     pub start_with_windows: bool,
     /// Keep the controls out of screenshots, recordings and streams (OBS, Discord...).
     pub hide_from_capture: bool,
+    /// Show "Playing Passthru" in Discord, with the time played, while there's a picture.
+    pub discord: bool,
     /// The signal's colour range: detected, or forced limited or full.
     pub range: crate::video::ColourRange,
     /// Last windowed position and size in logical pixels: x, y, width, height.
@@ -63,10 +65,11 @@ impl Default for Settings {
             rtx: true,
             auto_update: true,
             start_fullscreen: false,
-            open_on_signal: false,
-            close_on_signal_loss: false,
-            start_with_windows: false,
-            hide_from_capture: true,
+            open_on_signal: true,
+            close_on_signal_loss: true,
+            start_with_windows: true,
+            hide_from_capture: false,
+            discord: true,
             range: crate::video::ColourRange::Auto,
             window: None,
             run_only: RunOnly::default(),
@@ -139,7 +142,7 @@ mod tests {
     #[test]
     fn reads_files_with_a_byte_order_mark() {
         let s = parse(b"\xEF\xBB\xBF{\"volume\": 0.25, \"open_on_signal\": true}").unwrap();
-        assert_eq!((s.volume, s.open_on_signal, s.hide_from_capture), (0.25, true, true));
+        assert_eq!((s.volume, s.open_on_signal, s.hide_from_capture), (0.25, true, false));
     }
 
     #[test]

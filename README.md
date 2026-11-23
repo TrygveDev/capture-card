@@ -40,9 +40,12 @@ app the first time (the exe isn't code-signed): *More info › Run anyway*.
 - **HDR**: HDR10 input is tone mapped to SDR.
 - **FPS counter** with frame-time graphs, showing the game's own rate next to the displayed rate.
 - A borderless window with no clutter: drag anywhere to move, edges keep the aspect ratio, and
-  the controls hide when the mouse is still. Always-on-top and fullscreen are one key away.
-- **Hidden from recordings**: the controls stay out of screenshots, OBS and Discord (they see
-  only the video), on Windows 10 2004 and later.
+  the controls and the pointer hide when the mouse is still. Always-on-top and fullscreen are one key away.
+- **Hidden from recordings** (in Settings): the controls stay out of screenshots, OBS and
+  Discord (they see only the video), on Windows 10 2004 and later.
+- **Discord status**: while there's a picture, Discord shows *Playing Passthru · On a console*
+  with the time played (through the Discord app on the PC). Turn it off in Settings under
+  *Show activity in Discord*.
 - **Ready when the console is**: Passthru can wait in the tray, start with Windows, open when a
   signal arrives and close again when it's gone. In the tray it's only an icon: no CPU, under
   1 MB of memory, no GPU, and the capture card is free for other programs. Watching for a

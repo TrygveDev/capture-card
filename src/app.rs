@@ -36,3 +36,7 @@ pub fn data_dir() -> Option<PathBuf> {
     }
     Some(dir)
 }
+
+/// The Discord application whose name and icon the Discord status shows (discord.rs). Public:
+/// it only names the app, it isn't a secret.
+pub const DISCORD_APP_ID: &str = "1574419537909252257";

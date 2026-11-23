@@ -3,6 +3,7 @@
 mod app;
 mod audio;
 mod convert;
+mod discord;
 mod gpu;
 mod gputest;
 mod install;
@@ -154,6 +155,9 @@ struct Viewer {
     /// The signal as `tick` last saw it, and when it went.
     signal_on: bool,
     signal_lost_at: Option<Instant>,
+    /// The Discord status, and when its timer started (the picture arriving).
+    discord: discord::Presence,
+    discord_since: Option<u64>,
 }
 
 /// The controls' window: draws what `Viewer::render_controls` gives.
@@ -287,7 +291,7 @@ impl Viewer {
     }
 
     /// Polls the pointer: shows the controls while it moves over the window, hides them (and
-    /// the cursor, in fullscreen) once it's been still a while.
+    /// the cursor) once it's been still a while.
     /// Something is really on the input: frames, and a picture in them or sound with them
     /// lately.
     fn has_content(&self) -> bool {
@@ -444,7 +448,8 @@ impl Viewer {
         }
         winutil::set_controls_rect(if visible { self.pill_rect(scale) } else { None });
 
-        let hide_cursor = window.is_fullscreen() && cursor.is_some() && !visible;
+        // The pointer goes with the controls, windowed or fullscreen: a still mouse leaves only the picture.
+        let hide_cursor = cursor.is_some() && !visible;
         if hide_cursor != self.cursor_hidden {
             self.cursor_hidden = hide_cursor;
             winutil::set_cursor_hidden(hide_cursor);
@@ -486,6 +491,23 @@ impl Viewer {
             log::line("signal: gone, closing the window");
             self.close(window, cx);
         }
+        self.tick_discord();
+    }
+
+    /// The Discord status: on while there's a picture (and through the short gaps a console
+    /// switching resolution makes, so its timer doesn't restart), off with the setting.
+    fn tick_discord(&mut self) {
+        let showing = self.settings.discord
+            && self.window_shown
+            && (self.signal_on || self.signal_lost_at.is_some_and(|t| t.elapsed() < CLOSE_AFTER_LOSS));
+        if showing != self.discord_since.is_some() {
+            self.discord_since = showing.then(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64)
+            });
+        }
+        self.discord.set(self.discord_since);
     }
 
     /// Shows the tray icon while Passthru can wait there (or is waiting there).
@@ -600,6 +622,12 @@ impl Viewer {
             }
             Err(e) => self.toast(format!("Can't change Start with Windows: {e:#}")),
         }
+        cx.notify();
+    }
+
+    fn toggle_discord(&mut self, cx: &mut Context<Self>) {
+        self.settings.discord = !self.settings.discord;
+        self.settings.save();
         cx.notify();
     }
 
@@ -894,7 +922,7 @@ impl Viewer {
         )
     }
 
-    /// The settings menu: how the window behaves, waiting in the background, updates.
+    /// The settings menu: how the window behaves, what others see, waiting in the background, updates.
     fn settings_menu(&self, max_height: Pixels, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let s = &self.settings;
         let installed = install::running_installed();
@@ -904,66 +932,44 @@ impl Viewer {
             _ => None,
         };
         let checking = update_state == update::State::Checking;
-        let update_text = match update_state {
-            update::State::Off("not installed") => "Only the installed app updates itself".to_string(),
-            update::State::Off(_) => "Off".to_string(),
-            update::State::Checking => "Checking for a new version…".to_string(),
-            update::State::UpToDate => "Up to date".to_string(),
-            update::State::Ready(v) => format!("{v} downloaded: it starts next time"),
-            update::State::Failed(e) => format!("Couldn't check: {}", e.chars().take(80).collect::<String>()),
-        };
-        let secs = CLOSE_AFTER_LOSS.as_secs();
-        let blank = BLANK_AFTER.as_secs() + secs;
-        let loss_text = if s.stays_in_tray() {
-            format!("To the tray after {secs} s without a signal, {blank} s of blank, silent picture")
-        } else {
-            format!("Quits after {secs} s without a signal, {blank} s of blank, silent picture")
-        };
         menu_panel("settings-menu", 320., max_height)
             .child(menu_header("WINDOW"))
             .child(
-                menu_switch("on-top", "Always on top", Some("Above other windows (T)".into()), s.on_top, true)
+                menu_switch("on-top", "Always on top", s.on_top, true)
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_pin(cx))),
             )
             .child(
-                menu_switch("start-fullscreen", "Open in fullscreen", None, s.start_fullscreen, true)
+                menu_switch("start-fullscreen", "Open in fullscreen", s.start_fullscreen, true)
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_start_fullscreen(cx))),
             )
+            .child(menu_rule())
+            .child(menu_header("SHARING"))
             .child(
-                menu_switch(
-                    "hide-from-capture",
-                    "Hide controls from recordings",
-                    Some("Screenshots, OBS and Discord see only the video".into()),
-                    s.hide_from_capture,
-                    true,
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_hide_from_capture(cx))),
+                menu_switch("hide-from-capture", "Hide controls from recordings", s.hide_from_capture, true)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_hide_from_capture(cx))),
+            )
+            .child(
+                menu_switch("discord", "Show activity in Discord", s.discord, true)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_discord(cx))),
             )
             .child(menu_rule())
             .child(menu_header("BACKGROUND"))
             .child(
-                menu_switch(
-                    "open-on-signal",
-                    "Open when a signal arrives",
-                    Some("Closing the window keeps Passthru in the tray".into()),
-                    s.open_on_signal,
-                    true,
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_open_on_signal(cx))),
+                menu_switch("open-on-signal", "Open when a signal arrives", s.open_on_signal, true)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_open_on_signal(cx))),
             )
             .child(
-                menu_switch("close-on-loss", "Close when the signal is lost", Some(loss_text), s.close_on_signal_loss, true)
+                menu_switch("close-on-loss", "Close when the signal is lost", s.close_on_signal_loss, true)
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_close_on_loss(cx))),
             )
             .child({
-                let detail = if installed { "In the tray, ready for a signal" } else { "Only for the installed app" };
-                let row = menu_switch("start-with-windows", "Start with Windows", Some(detail.into()), s.start_with_windows, installed);
+                let row = menu_switch("start-with-windows", "Start with Windows", s.start_with_windows, installed);
                 if installed { row.on_click(cx.listener(|this, _, _, cx| this.toggle_start_with_windows(cx))) } else { row }
             })
             .child(menu_rule())
             .child(menu_header("UPDATES"))
             .child({
-                let row = menu_switch("autoupdate", "Update automatically", Some(update_text), s.auto_update, installed);
+                let row = menu_switch("autoupdate", "Update automatically", s.auto_update, installed);
                 if installed { row.on_click(cx.listener(|this, _, _, cx| this.toggle_auto_update(cx))) } else { row }
             })
             .when(installed && ready.is_none(), |d| {
@@ -1103,7 +1109,7 @@ fn menu_item(id: gpui::ElementId, label: String, detail: Option<String>, checked
 }
 
 /// A setting that's on or off: its label, and a switch at the right.
-fn menu_switch(id: &'static str, label: &'static str, detail: Option<String>, on: bool, enabled: bool) -> gpui::Stateful<gpui::Div> {
+fn menu_switch(id: &'static str, label: &'static str, on: bool, enabled: bool) -> gpui::Stateful<gpui::Div> {
     let switch = div()
         .relative()
         .w(px(28.))
@@ -1121,7 +1127,7 @@ fn menu_switch(id: &'static str, label: &'static str, detail: Option<String>, on
                 .rounded_full()
                 .bg(if on { rgb(0x121212) } else { rgb(0xffffff) }),
         );
-    menu_row(id, enabled).gap(px(12.)).child(menu_label(label, detail)).child(switch)
+    menu_row(id, enabled).gap(px(12.)).child(menu_label(label, None)).child(switch)
 }
 
 /// Something to do (check for updates), lined up with the labels above it.
@@ -2053,6 +2059,8 @@ fn main() {
                     window_shown: true,
                     signal_on: false,
                     signal_lost_at: None,
+                    discord: discord::Presence::spawn(),
+                    discord_since: None,
                     fullscreen: false,
                     controls_drawn: false,
                     requests,
