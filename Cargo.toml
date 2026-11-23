@@ -1,6 +1,6 @@
 [package]
 name = "passthru"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 description = "Lightweight, low-latency capture card viewer with GPU frame generation"
 license = "PolyForm-Noncommercial-1.0.0"
