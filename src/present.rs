@@ -354,6 +354,10 @@ struct Place {
     first: Instant,
     /// Moved a refresh earlier where a step is only one refresh: leave a generated frame out.
     skip: bool,
+    /// Moved a refresh earlier where only waiting held it back: this pair's real picture comes
+    /// a refresh early (a step of several refreshes has one to give), so the next picture
+    /// doesn't arrive just before it's due and wait behind it, and makes the earlier place.
+    pull: bool,
 }
 
 impl Grid {
@@ -370,7 +374,7 @@ impl Grid {
     /// Where a pair starts that can be shown from refresh `ready`, and could have been from
     /// `could` if it hadn't waited behind the last picture's present.
     fn place(&mut self, ready: Instant, could: Instant, every: Duration, refresh: Duration, now: Instant) -> Place {
-        let at = |first| Place { first, skip: false };
+        let at = |first| Place { first, skip: false, pull: false };
         let Some(last) = self.last else {
             self.since = None;
             return at(ready);
@@ -413,6 +417,11 @@ impl Grid {
                 self.moved = Some(now);
             } else if earlier && room >= 1 {
                 place.first -= refresh;
+                self.moved = Some(now);
+            } else if earlier && step >= 2 {
+                // It could have if it hadn't waited: the wait goes once the last picture's
+                // present no longer falls just after the next one arrives.
+                place.pull = true;
                 self.moved = Some(now);
             }
         }
@@ -1407,7 +1416,7 @@ impl Video<'_> {
         let now = Instant::now();
         let step = span / steps as f64;
         let ready = submitted + self.planned_gpu();
-        let (mut first, every) = match timing {
+        let (mut first, every, pull) = match timing {
             Some((next, period)) => {
                 let k = (step / period.as_secs_f64()).round().max(1.0) as u32;
                 // The first present: `PRESENT_PHASE` into a refresh, once the GPU has made the
@@ -1430,9 +1439,12 @@ impl Video<'_> {
                 if place.skip && made.len() > 1 {
                     made.remove(0);
                 }
-                (place.first, every)
+                if place.pull {
+                    telemetry::note("pacing", || format!("picture {}: its real picture a refresh early to take delay back", raw.seq));
+                }
+                (place.first, every, place.pull.then_some(period))
             }
-            None => (now, Duration::from_secs_f64(step)),
+            None => (now, Duration::from_secs_f64(step), None),
         };
         // Still busy with the last pair (the game's last picture came late and this one
         // early, or a slow pair pushed things later): fit what's waiting in before this pair.
@@ -1457,7 +1469,9 @@ impl Video<'_> {
             }));
         }
         let last = made.len() as u32;
-        let real_at = first + every * last;
+        // Pulled a refresh early, the real picture still follows the last generated frame.
+        let pull = pull.filter(|&p| every >= p * 2 && last > 0).unwrap_or_default();
+        let real_at = first + every * last - pull;
         self.grid.last = Some(real_at);
         for (j, what) in made.into_iter().enumerate() {
             self.queue.push_back(Entry { at: first + every * j as u32, what, arrived: None });
@@ -1585,7 +1599,7 @@ mod tests {
                 out.push((gap, place.skip));
             }
             let steps = 8 / step - u32::from(place.skip);
-            g.last = Some(place.first + r * step * (steps - 1));
+            g.last = Some(place.first + r * step * (steps - 1) - if place.pull { r } else { Duration::ZERO });
         }
         out
     }
@@ -1629,6 +1643,42 @@ mod tests {
         // A step is one refresh: a generated frame is left out once.
         let gaps = run_grid(|i| if i == 10 { 2 } else { 1 }, 300, 1);
         assert_eq!(gaps.iter().filter(|(_, skip)| *skip).count(), 1);
+    }
+
+    /// 30 -> 120 at 240 Hz as the presenter runs it: a picture that arrives just before the
+    /// last one's present waits for it (`would_delay_present`). Returns from arrival to the
+    /// first frame of each pair, in milliseconds.
+    fn run_waiting(n: u32, gpu_us: impl Fn(u32) -> u64) -> Vec<f64> {
+        let r = Duration::from_micros(4167);
+        let every = r * 2;
+        let t0 = Instant::now();
+        let on_refresh = |t: Instant| t0 + r * (t.saturating_duration_since(t0).as_micros() as u64).div_ceil(4167) as u32;
+        let mut g = Grid::new();
+        let mut out = vec![];
+        for i in 0..n {
+            let arrival = t0 + Duration::from_micros(33_333 * u64::from(i) + 700);
+            let gpu = Duration::from_micros(gpu_us(i));
+            let start = match g.last {
+                Some(due) if due > arrival && due < arrival + gpu + DEFER_MARGIN => due,
+                _ => arrival,
+            };
+            let place = g.place(on_refresh(start + gpu), on_refresh(arrival + gpu), every, r, start);
+            out.push(place.first.saturating_duration_since(arrival).as_secs_f64() * 1000.0);
+            g.last = Some(place.first + every * 3 - if place.pull { r } else { Duration::ZERO });
+        }
+        out
+    }
+
+    #[test]
+    fn a_picture_waiting_behind_the_last_ones_present_does_not_hold_delay_up() {
+        // The first pairs go by the 8 ms guess, before the GPU's time is measured; then 5 ms
+        // (copy, GPU work and margin at 4K).
+        let d = run_waiting(300, |i| if i < 3 { 8000 } else { 5000 });
+        let late: Vec<f64> = d[150..].to_vec();
+        let mean = late.iter().sum::<f64>() / late.len() as f64;
+        // Two refreshes after arrival (the clocks drift it up to a little more before the next
+        // move), not three behind the wait (12 ms and more, for good).
+        assert!(mean < 9.5, "{mean:.1} ms from arrival to the first frame: {:?}", &d[..40]);
     }
 
     #[test]
