@@ -118,11 +118,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     unsafe {
         let prev: WNDPROC = std::mem::transmute(PREV_PROC.load(Ordering::Relaxed));
         match msg {
-            // A click makes this the active app. Left to Windows, a click on the video (a
-            // caption to Windows, for drag-anywhere; or under the controls' window) answers
-            // "don't activate" and the window is activated later in the press, too late to
-            // count as the user's: active inside Passthru, but the taskbar and the keyboard
-            // stayed with the app before.
+            // A click activates the window. Left to Windows, a click on the video (a caption to
+            // Windows, for drag-anywhere) answers "don't activate" and the window is activated
+            // later in the press, too late to count as the user's choice.
             WM_MOUSEACTIVATE => {
                 if GetForegroundWindow() != hwnd {
                     let _ = SetForegroundWindow(hwnd);
@@ -238,8 +236,12 @@ pub fn install_overlay(overlay: HWND, main: HWND, hidden_from_capture: bool) {
     unsafe {
         // Owned by the main window: always above it, minimized and restored with it.
         SetWindowLongPtrW(overlay, GWLP_HWNDPARENT, main.0 as isize);
+        // Not WS_EX_NOACTIVATE, though it's never activated (WM_MOUSEACTIVATE below): a click
+        // that lands on a window with that style doesn't count as choosing the app, so Windows
+        // keeps the foreground where it was (Windows Search stayed open, and the window behind
+        // it stayed in front) and Passthru can't take it either.
         let ex = GetWindowLongPtrW(overlay, GWL_EXSTYLE) as u32;
-        SetWindowLongPtrW(overlay, GWL_EXSTYLE, (ex | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as isize);
+        SetWindowLongPtrW(overlay, GWL_EXSTYLE, ((ex & !WS_EX_NOACTIVATE.0) | WS_EX_TOOLWINDOW.0) as isize);
         let prev = SetWindowLongPtrW(overlay, GWLP_WNDPROC, overlay_proc as *const () as usize as isize);
         OVERLAY_PREV_PROC.store(prev, Ordering::Relaxed);
         OVERLAY.store(overlay.0 as isize, Ordering::Relaxed);
