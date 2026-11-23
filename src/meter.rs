@@ -7,6 +7,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::quality::Quality;
+
 /// Graph columns, each covering `COLUMN`: 4.8 seconds in all.
 pub const COLUMNS: usize = 240;
 const COLUMN: Duration = Duration::from_millis(20);
@@ -22,6 +24,8 @@ pub struct Meter {
     on: AtomicBool,
     /// GPU time for a pair of pictures while smoothing, f32 milliseconds (0: not smoothing).
     gpu_ms: AtomicU32,
+    /// Smoothing's quality level, its index plus 1 (0: not known).
+    quality: AtomicU32,
     /// Graph columns are whole `COLUMN`s from here, so they keep their contents as they scroll.
     epoch: Instant,
     history: Mutex<History>,
@@ -78,6 +82,8 @@ pub struct Numbers {
     pub delay_ms: Option<f32>,
     /// GPU time for a pair of pictures while smoothing, milliseconds.
     pub gpu_ms: Option<f32>,
+    /// The quality level smoothing is running at.
+    pub quality: Option<Quality>,
 }
 
 /// A frame-time graph, oldest column first: the shortest and longest frame time in each.
@@ -93,6 +99,7 @@ impl Meter {
         Meter {
             on: AtomicBool::new(false),
             gpu_ms: AtomicU32::new(0),
+            quality: AtomicU32::new(0),
             epoch: Instant::now(),
             history: Mutex::new(History::default()),
         }
@@ -139,6 +146,10 @@ impl Meter {
         self.gpu_ms.store(ms.to_bits(), Ordering::Relaxed);
     }
 
+    pub fn set_quality(&self, q: Option<Quality>) {
+        self.quality.store(q.map_or(0, |q| q as u32 + 1), Ordering::Relaxed);
+    }
+
     pub fn numbers(&self, now: Instant) -> Numbers {
         let h = self.history.lock().unwrap();
         let recent = |t: Instant| now.saturating_duration_since(t) <= RATE_OVER;
@@ -166,6 +177,7 @@ impl Meter {
             generated: if n > 0 { made as f32 / n as f32 } else { 0.0 },
             delay_ms: (!delays.is_empty()).then(|| delays.iter().sum::<f32>() / delays.len() as f32),
             gpu_ms: (gpu > 0.0).then_some(gpu),
+            quality: (self.quality.load(Ordering::Relaxed) as usize).checked_sub(1).and_then(|i| Quality::ALL.get(i).copied()),
         }
     }
 

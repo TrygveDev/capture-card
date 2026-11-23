@@ -28,6 +28,13 @@ app the first time (the exe isn't code-signed): *More info › Run anyway*.
   with bidirectional optical flow on the GPU (D3D11 compute shaders). Any vendor's GPU works.
   A menu highlight jumping to another row isn't smoothed: where the text under it inverts,
   the new picture shows at once (or cross-fades, if the rest of the picture moves).
+  A HUD (minimap, bars, subtitles) over a moving camera is found by its hard edges staying put
+  and is held as it is, so it isn't dragged along with the scenery under it.
+- **As much quality as the GPU has room for**: frame generation runs at Light, Balanced or High,
+  chosen live from the GPU's own timings (so the resolution, the target rate and a busy GPU all
+  count). The levels differ in how much grain they clean up around moving edges. The frame a
+  present waits for gets at most 0.5 ms more than Light, so quality costs GPU rather than delay.
+  The full FPS counter shows the level.
 - **Upscaling**: NVIDIA RTX Video Super Resolution when it's available, otherwise a Lanczos
   shader.
 - **HDR**: HDR10 input is tone mapped to SDR.
@@ -119,6 +126,7 @@ every pull request is built and tested too (the exe is kept as a build artifact)
 - `--mode 2560x1440@60`: pick a capture mode
 - `--smooth 120`: frame generation target for this run
 - `--stats`: print frame rate and latency every few seconds
+- `PASSTHRU_QUALITY=light|balanced|high` (environment variable): hold one quality level
 - `--test-pattern 60/30 [--test-size 3840x2160]`: run without a capture card (60 Hz signal
   carrying a 30 fps "game")
 

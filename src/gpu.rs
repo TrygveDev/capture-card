@@ -20,6 +20,7 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{Interface, PCSTR};
 
 use crate::convert::{self, Matrix};
+use crate::quality::Quality;
 use crate::video::Layout;
 
 const SOURCE: &str = include_str!("gpu.hlsl");
@@ -77,10 +78,13 @@ struct Kernels {
     flow_snap: Kernel,
     flow_check: Kernel,
     flow_inplace: Kernel,
+    flow_edges: Kernel,
+    flow_held: Kernel,
     flow_fill: Kernel,
     flow_final: Kernel,
     project: Kernel,
-    compose: Kernel,
+    /// By `Quality`.
+    compose: [Kernel; 3],
     luma8: Kernel,
     hw_dense: Kernel,
     hw_seed: Kernel,
@@ -96,6 +100,74 @@ pub struct Gpu {
     ps: ID3D11PixelShader,
     /// While profiling: timestamps around every dispatch.
     prof: std::cell::RefCell<Option<Profile>>,
+}
+
+/// How long pieces of work took the GPU, by its own clock, picked up without ever waiting.
+pub struct Timer<T> {
+    sets: Vec<Stamps>,
+    /// Ended and not read back yet, oldest first.
+    running: std::collections::VecDeque<(usize, T)>,
+    free: Vec<usize>,
+}
+
+struct Stamps {
+    disjoint: ID3D11Query,
+    begin: ID3D11Query,
+    end: ID3D11Query,
+}
+
+/// Pieces timed at once at most; any more just go untimed.
+const TIMED: usize = 32;
+
+impl<T> Timer<T> {
+    /// Without timestamps (a driver that has none) nothing is ever timed.
+    pub fn new(gpu: &Gpu) -> Timer<T> {
+        let make = || -> Option<Stamps> {
+            let desc = D3D11_QUERY_DESC { Query: D3D11_QUERY_TIMESTAMP_DISJOINT, MiscFlags: 0 };
+            let mut q = None;
+            unsafe { gpu.device.CreateQuery(&desc, Some(&mut q)).ok()? };
+            Some(Stamps { disjoint: q?, begin: gpu.timestamp()?, end: gpu.timestamp()? })
+        };
+        let sets: Vec<Stamps> = (0..TIMED).map_while(|_| make()).collect();
+        Timer { free: (0..sets.len()).collect(), sets, running: Default::default() }
+    }
+
+    /// Runs `work`, timed as `tag`. Timed pieces don't nest.
+    pub fn time<R>(&mut self, gpu: &Gpu, tag: T, work: impl FnOnce() -> R) -> R {
+        let Some(i) = self.free.pop() else { return work() };
+        unsafe {
+            gpu.ctx.Begin(&self.sets[i].disjoint);
+            gpu.ctx.End(&self.sets[i].begin);
+        }
+        let out = work();
+        unsafe {
+            gpu.ctx.End(&self.sets[i].end);
+            gpu.ctx.End(&self.sets[i].disjoint);
+        }
+        self.running.push_back((i, tag));
+        out
+    }
+
+    /// The oldest piece the GPU has finished with a time to go by.
+    pub fn poll(&mut self, gpu: &Gpu) -> Option<(T, std::time::Duration)> {
+        loop {
+            let &(i, _) = self.running.front()?;
+            let s = &self.sets[i];
+            let mut dj = D3D11_QUERY_DATA_TIMESTAMP_DISJOINT::default();
+            // "Not yet" reads as success and leaves the data alone (no frequency then).
+            if !gpu.peek(&s.disjoint, &mut dj) || dj.Frequency == 0 {
+                return None;
+            }
+            let (mut from, mut to) = (0u64, 0u64);
+            let read = gpu.peek(&s.begin, &mut from) && gpu.peek(&s.end, &mut to);
+            let (i, tag) = self.running.pop_front()?;
+            self.free.push(i);
+            if read && !dj.Disjoint.as_bool() && from != 0 && to > from {
+                let secs = (to - from) as f64 / dj.Frequency as f64;
+                return Some((tag, std::time::Duration::from_secs_f64(secs)));
+            }
+        }
+    }
 }
 
 struct Profile {
@@ -186,10 +258,14 @@ impl Gpu {
             "flow_snap",
             "flow_check",
             "flow_inplace",
+            "flow_edges",
+            "flow_held",
             "flow_fill",
             "flow_final",
             "project",
             "compose",
+            "compose_balanced",
+            "compose_high",
             "luma8",
             "hw_dense",
             "hw_seed",
@@ -222,10 +298,12 @@ impl Gpu {
             flow_snap: cs()?,
             flow_check: cs()?,
             flow_inplace: cs()?,
+            flow_edges: cs()?,
+            flow_held: cs()?,
             flow_fill: cs()?,
             flow_final: cs()?,
             project: cs()?,
-            compose: cs()?,
+            compose: [cs()?, cs()?, cs()?],
             luma8: cs()?,
             hw_dense: cs()?,
             hw_seed: cs()?,
@@ -461,6 +539,19 @@ impl Gpu {
         Ok(out)
     }
 
+    /// A query's data as it stands, without flushing or waiting.
+    fn peek<T>(&self, q: &ID3D11Query, into: &mut T) -> bool {
+        unsafe {
+            self.ctx.GetData(
+                q,
+                Some(into as *mut T as _),
+                std::mem::size_of::<T>() as u32,
+                D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
+            )
+        }
+        .is_ok()
+    }
+
     fn timestamp(&self) -> Option<ID3D11Query> {
         let desc = D3D11_QUERY_DESC { Query: D3D11_QUERY_TIMESTAMP, MiscFlags: 0 };
         let mut q = None;
@@ -599,6 +690,9 @@ struct Gen {
     /// Level-0 flow after snapping to edges, per direction.
     snapped: [Tex; 2],
     info: [Tex; 2],
+    /// What stayed as it was, and for how long (per set), and from that the overlays.
+    edges: [Tex; 2],
+    held: Tex,
     fin: [Tex; 2],
     keys: [Tex; 2],
     counts: Tex,
@@ -609,7 +703,7 @@ struct Gen {
 }
 
 /// Counters of a pair's motion (see gpu.hlsl's `CountsIn`).
-pub const COUNTS: usize = 10;
+pub const COUNTS: usize = 11;
 
 /// Most generated frames kept at once (each one frame in size): two pairs' worth at 30 -> 240.
 pub const OUTS: usize = 14;
@@ -807,6 +901,8 @@ impl Gen {
                 gpu.tex(p0w, p0h, DXGI_FORMAT_R32G32_FLOAT, true)?,
             ],
             info: [level0()?, level0()?],
+            edges: [gpu.tex(p0w, p0h, DXGI_FORMAT_R32_FLOAT, true)?, gpu.tex(p0w, p0h, DXGI_FORMAT_R32_FLOAT, true)?],
+            held: gpu.tex(p0w, p0h, DXGI_FORMAT_R32_FLOAT, true)?,
             fin: [level0()?, level0()?],
             keys: [gpu.tex(w, h, DXGI_FORMAT_R32_UINT, true)?, gpu.tex(w, h, DXGI_FORMAT_R32_UINT, true)?],
             counts: gpu.tex(COUNTS as u32, 1, DXGI_FORMAT_R32_UINT, true)?,
@@ -1055,6 +1151,12 @@ impl Frames {
             misc: [0.0, self.scale0 as f32, 0.0, 0.0],
             ..Default::default()
         };
+        // Overlays standing still over moving scenery, from both pictures at full size.
+        let srvs = [(16, &self.slots[a].frame), (17, &self.slots[b].frame), (25, &fg.edges[prev])];
+        let pe = Params { fl: [if fg.temporal { F_TEMPORAL } else { 0 }, 0, 0, 0], ..pf };
+        gpu.run(&gpu.k.flow_edges, &pe, &srvs, &[(1, &fg.edges[cur])], g);
+        let srvs = [(10, &fg.snapped[0]), (23, &fg.edges[cur])];
+        gpu.run(&gpu.k.flow_held, &p, &srvs, &[(1, &fg.held), (4, &fg.counts)], g);
         for dir in 0..2 {
             let (sx, _) = pair(dir);
             let srvs = [(10, &fg.snapped[dir]), (20, &fg.info[dir]), (21, &sx.frame)];
@@ -1078,7 +1180,7 @@ impl Frames {
     }
 
     /// Generates the frame at time `t` between slots `a` and `b` into generated frame `out`.
-    pub fn interpolate(&self, gpu: &Gpu, a: usize, b: usize, t: f32, out: usize) {
+    pub fn interpolate(&self, gpu: &Gpu, a: usize, b: usize, t: f32, out: usize, quality: Quality) {
         let fg = self.fg();
         for k in &fg.keys {
             unsafe { gpu.ctx.ClearUnorderedAccessViewUint(k.uav.as_ref().expect("uav"), &[u32::MAX; 4]) };
@@ -1090,17 +1192,28 @@ impl Frames {
         };
         let fin = [(12, &fg.fin[0]), (13, &fg.fin[1])];
         let g = (groups(self.w, 16), groups(self.h, 16));
-        gpu.run_z(&gpu.k.project, &p, &fin, &[(5, &fg.keys[0]), (6, &fg.keys[1])], (g.0, g.1, 2));
+        let held = (24, &fg.held);
+        let (fa, fb) = ((16, &self.slots[a].frame), (17, &self.slots[b].frame));
+        gpu.run_z(&gpu.k.project, &p, &[fin[0], fin[1], fa, fb, (18, &fg.counts), held], &[(5, &fg.keys[0]), (6, &fg.keys[1])], (g.0, g.1, 2));
         let srvs = [
             fin[0],
             fin[1],
             (14, &fg.keys[0]),
             (15, &fg.keys[1]),
-            (16, &self.slots[a].frame),
-            (17, &self.slots[b].frame),
+            fa,
+            fb,
             (18, &fg.counts),
+            held,
         ];
-        gpu.run(&gpu.k.compose, &p, &srvs, &[(7, &self.outs[out])], g);
+        gpu.run(&gpu.k.compose[quality as usize], &p, &srvs, &[(7, &self.outs[out])], g);
+    }
+
+    /// How many level-0 pixels the last pair found to be overlay, whether or not the camera
+    /// moved enough for that to count.
+    #[cfg(test)]
+    pub fn held_count(&self, gpu: &Gpu) -> Result<usize> {
+        let bytes = gpu.read(&self.fg().held, 4)?;
+        Ok(bytes.as_chunks::<4>().0.iter().filter(|b| f32::from_le_bytes(**b) > 0.0).count())
     }
 
     /// The finished level-0 fields of direction `dir` (0: A -> B), per pixel: vector x, y,

@@ -14,10 +14,14 @@
 //     field is marked unreliable.
 //     A menu changing in place is told apart here too (flow_inplace): that shows the new
 //     picture at once, or cross-fades if the rest moves.
+//     An overlay (HUD) over moving scenery is found too, by its hard edges staying exactly
+//     where they were for several pictures (flow_edges, flow_held): it's held as it is.
 //  3. For each in-between time t, every pixel of A is pushed forward along its motion and every
 //     pixel of B backward; where several land on one spot, the one visible in both pictures
 //     (then the slower one) wins. A spot reached from only one side shows only that side, which
-//     is what keeps edges of moving things clean. Unreliable areas fade to a plain blend.
+//     is what keeps edges of moving things clean. Unreliable areas fade to a plain blend, and
+//     grain between pixels that picked different sources is averaged away (clean: as far as
+//     the quality level goes, see quality.rs).
 //
 // Continuous coordinates: pixel k spans [k, k+1), its centre is k + 0.5. A vector v at a pixel
 // of X says where it is in Y: centre + v.
@@ -76,10 +80,14 @@ Texture2D<uint>   CountsIn  : register(t18); // per pair, A->B: 0 patches missed
                                              // 2, 3 their cost and detail (the cut test), 4 level-0
                                              // pixels that changed, 5 of those motion can't follow,
                                              // 6 of those hidden, 7 visible but unexplained,
-                                             // 8 blocks inverted in place, 9 pixels changed a lot
+                                             // 8 blocks inverted in place, 9 pixels changed a lot,
+                                             // 10 pixels on the move
 Texture2D<float4> Shown     : register(t19);
 Texture2D<float4> InfoIn    : register(t20);
 Texture2D<float4> FX        : register(t21); // the picture motion is measured from, in colour
+Texture2D<float>  EdgesIn   : register(t23); // per level-0 pixel, what stayed as it was: see flow_edges
+Texture2D<float>  HeldIn    : register(t24); // per level-0 pixel, overlay: see flow_held
+Texture2D<float>  EdgesWere : register(t25); // EdgesIn, of the pair before
 Texture2D<int2>   HwFlow    : register(t22); // hardware optical flow: full-size pixels x 32, a vector per misc.z pixels
 SamplerState Lin : register(s0);
 
@@ -523,7 +531,7 @@ void flow_snap(uint3 id : SV_DispatchThreadID) {
 #define OCC_ABS 0.75
 #define OCC_REL 0.1
 // The mismatch is stored relative to that allowance: above 1 is hidden. Pixels moving out of
-// the picture get LEAVING: as hidden as can be when competing for a spot, but not filled.
+// the picture get LEAVING: as hidden as can be when competing for a spot, and filled too.
 #define OCCLUDED 1.0
 #define LEAVING -100.0
 // Levels of difference per pixel motion may leave unexplained before the area counts as
@@ -536,10 +544,21 @@ void flow_snap(uint3 id : SV_DispatchThreadID) {
 #define RATIO_RAMP 0.3
 // Hidden pixels come in bands beside moving edges. Where more than HIDDEN_START of a 31x31
 // window (level-0 pixels, sampled 5 apart) is hidden, ramping over HIDDEN_RAMP, nothing
-// matched at all (a screen changing in place), so blend.
+// matched at all (a screen changing in place, spray), so blend.
 #define HIDDEN_STEP 5
-#define HIDDEN_START 0.85
+#define HIDDEN_START 0.55
 #define HIDDEN_RAMP 0.2
+// Beside the picture's edge, where things leave it (LEAVING_SHARE of that window is all the
+// way), motion changing by over RAGGED_STEP + RAGGED_REL of itself from one pixel to the next
+// in more than RAGGED_START of the places looked (ramping over RAGGED_RAMP) is grain: blend.
+// One thing's edge is a single line through the window.
+#define LEAVING_SHARE 0.15
+#define RAGGED_STEP 1.5
+#define RAGGED_REL 0.15
+#define RAGGED_START 0.15
+#define RAGGED_RAMP 0.2
+// Filling what leaves the picture: motion that would keep it inside costs this much more.
+#define STAYS 60.0
 // Levels of difference between A and B (unmoved) for a level-0 pixel to count as changed.
 #define CHANGED 4.0
 // The UI-change test: when more than LOST_START of what changed can't be followed (ramping to
@@ -550,6 +569,15 @@ void flow_snap(uint3 id : SV_DispatchThreadID) {
 // test pattern's bar sits at 0.44, so the ramp starts above that.
 #define LOST_START 0.55
 #define LOST_RAMP 0.1
+// A value changing its text, or an item appearing: under SMALL of the picture changed (ramping
+// out over SMALL_RAMP), most of that a lot (SMALL_HARD), some of it with nothing to come from
+// (SMALL_HIDDEN); then SMALL_LOST unfollowable is enough. All three are needed: small motion
+// (someone talking, a map creeping along) is small too, and is 3% of gameplay.
+#define SMALL 0.005
+#define SMALL_RAMP 0.001
+#define SMALL_HARD 0.5
+#define SMALL_HIDDEN 0.1
+#define SMALL_LOST 0.2
 
 // The in-place test, for what the UI-change test misses: a highlight jumping rows matches
 // perfectly well as a bar that moved (the better the search, the better it matches), so too
@@ -623,8 +651,8 @@ void flow_check(uint3 id : SV_DispatchThreadID) {
     float2 w = FlowOther.SampleLevel(Lin, q / size, 0);
     float e = length(v + w) / (OCC_ABS + OCC_REL * 0.5 * (length(v) + length(w)));
     float moved = abs(sy(q) - tx);
-    // Leaving the picture: hidden in Y, but the vector is fine (nothing to check it against),
-    // so it's marked LEAVING to be kept rather than filled.
+    // Leaving the picture: hidden in Y, and nothing to check the vector against (the search
+    // matched it to the stretched border), so it's marked LEAVING and filled.
     if (any(q < 0.0) || any(q > size)) {
         e = LEAVING;
         moved = 0.0;
@@ -632,10 +660,119 @@ void flow_check(uint3 id : SV_DispatchThreadID) {
     Out4[x] = float4(e, moved, abs(ly(x) - tx), 0.0);
 }
 
+// Overlays. A pixel stayed when no channel moved by over SAME; a hard edge stayed when two
+// neighbours that both did differ by over EDGE. One that has for EDGE_AGE pairs running is an
+// overlay's: railings and letters sliding by line up by chance, but not time after time. A
+// level-0 pixel belongs to the overlay when such an edge is within HELD_REACH of it through
+// pixels that stayed as long (a bar's fill, a digit; smooth scenery beside one matches for a
+// pair or two, and would show as blotches). That only counts while the camera moves
+// (HELD_MOVING of the picture is on the move, by over MOVES level-0 pixels): before a still
+// background everything stayed, and what passes over it mustn't be rubbed out.
+#define SAME (10.0 / 255.0)
+#define EDGE (40.0 / 255.0)
+#define EDGE_AGE 4
+#define HELD_REACH 6
+#define HELD_MOVING 0.6
+#define MOVES 1.0
+#define STAYED_MOST 1.0
+#define STAYED_EDGE 2.0
+
+float most(float3 c) {
+    return max(c.r, max(c.g, c.b));
+}
+
+bool stayed(int2 q, int2 m) {
+    int3 at = int3(clamp(q, int2(0, 0), m), 0);
+    return most(abs(FA.Load(at).rgb - FB.Load(at).rgb)) <= SAME;
+}
+
+// Per level-0 pixel: STAYED_EDGE with a hard edge that stayed in it, plus how many pairs running
+// it had before this one (up to EDGE_AGE), STAYED_MOST where most of it stayed, else 0. The
+// fraction is how many pairs running most of it has stayed, in sixteenths.
+[numthreads(8, 8, 1)]
+void flow_edges(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= (uint2)sz.xy)) return;
+    int s = (int)misc.y;
+    int2 o = int2(id.xy) * s;
+    int2 m = sz.zw - 1;
+    uint n = 0;
+    float found = 0.0;
+    [loop] for (int j = 0; j < s; j++) {
+        [loop] for (int i = 0; i < s; i++) {
+            int2 q = min(o + int2(i, j), m);
+            float3 c = FA.Load(int3(q, 0)).rgb;
+            [branch] if (most(abs(c - FB.Load(int3(q, 0)).rgb)) <= SAME) {
+                n++;
+                [branch] if (found == 0.0) {
+                    int3 r = int3(min(q + int2(1, 0), m), 0);
+                    int3 d = int3(min(q + int2(0, 1), m), 0);
+                    float3 cr = FA.Load(r).rgb;
+                    float3 cd = FA.Load(d).rgb;
+                    [branch] if (most(abs(cr - c)) > EDGE) {
+                        if (most(abs(cr - FB.Load(r).rgb)) <= SAME) found = STAYED_EDGE;
+                    }
+                    [branch] if (most(abs(cd - c)) > EDGE) {
+                        if (most(abs(cd - FB.Load(d).rgb)) <= SAME) found = STAYED_EDGE;
+                    }
+                }
+            }
+        }
+    }
+    float was = (fl.x & F_TEMPORAL) ? EdgesWere.Load(int3(id.xy, 0)) : 0.0;
+    if (found > 0.0 && was >= STAYED_EDGE) found = min(floor(was) + 1.0, STAYED_EDGE + EDGE_AGE);
+    float most_for = 0.0;
+    if (2 * n >= (uint)(s * s)) most_for = min(frac(was) * 16.0 + 1.0, 15.0);
+    if (found == 0.0 && most_for > 0.0) found = STAYED_MOST;
+    OutLuma[id.xy] = found + most_for / 16.0;
+}
+
 static const float2 DIRS[8] = {
     float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1),
     float2(1, 1), float2(-1, 1), float2(1, -1), float2(-1, -1),
 };
+
+// 1 where it's overlay: an edge that has stayed long enough is in reach. Counts what's moving.
+[numthreads(8, 8, 1)]
+void flow_held(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= (uint2)sz.xy)) return;
+    int2 x = int2(id.xy);
+    int2 m = sz.xy - 1;
+    // One in 16 counts for all of them: a share doesn't need every one, and each is an atomic.
+    [branch] if (((x.x | x.y) & 3) == 0) {
+        float2 v = FlowIn.Load(int3(x, 0));
+        if (abs(v.x) + abs(v.y) > MOVES) {
+            uint old;
+            InterlockedAdd(Counts[int2(10, 0)], 16, old);
+        }
+    }
+    float aged = STAYED_EDGE + EDGE_AGE - 1;
+    bool reached = EdgesIn.Load(int3(x, 0)) >= aged;
+    [loop] for (int d = 0; d < 8 && !reached; d++) {
+        int2 dir = int2(DIRS[d]);
+        [loop] for (int s = 1; s <= HELD_REACH; s++) {
+            float there = EdgesIn.Load(int3(clamp(x + dir * s, int2(0, 0), m), 0));
+            if (there >= aged) {
+                reached = true;
+                break;
+            }
+            if (there < STAYED_MOST || frac(there) * 16.0 < EDGE_AGE) break;
+        }
+    }
+    OutLuma[x] = reached ? 1.0 : 0.0;
+}
+
+// Whether full-size pixel p is overlay: in a held level-0 pixel, and it stayed itself along
+// with two of those next to it (one alone is scenery that happens to match).
+bool held_at(int2 p) {
+    if (HeldIn.Load(int3(p / (int)misc.y, 0)) == 0.0) return false;
+    float plane = (float)sz.x * (float)sz.y / (misc.y * misc.y);
+    if ((float)CountsIn.Load(int3(10, 0, 0)) < HELD_MOVING * plane) return false;
+    int2 m = sz.xy - 1;
+    if (!stayed(p, m)) return false;
+    uint n = 0;
+    [unroll] for (int k = 0; k < 4; k++) n += stayed(p + int2(DIRS[k]), m) ? 1 : 0;
+    return n >= 2;
+}
 
 // What the full-size pixels around level-0 pixel p look like (4x4 samples, spaced to cover two
 // level-0 pixels each way): mean colour, and how busy they are (mean absolute deviation of
@@ -657,28 +794,44 @@ float4 look(int2 p) {
     return float4(s, busy / 16.0) * 255.0;
 }
 
+// Whether n was checked along with most of the pixels 2 around it: a single lucky pixel in an
+// area where nothing matched has nothing to lend.
+bool solid(int2 n, int2 m) {
+    uint ok = 0;
+    [unroll] for (int k = 0; k < 4; k++) {
+        float en = InfoIn.Load(int3(clamp(n + int2(DIRS[k]) * 2, int2(0, 0), m), 0)).x;
+        ok += en >= 0.0 && en <= OCCLUDED ? 1 : 0;
+    }
+    return ok >= 3;
+}
+
 // Hidden pixels take the motion of visible pixels nearby (their own vector matched nothing):
 // look outward in 8 directions for the first visible pixel (hidden bands beside fast motion
 // are wide) and take the motion of the side that looks most alike (colour, and how busy:
 // a HUD's dark bits can match dark scenery in colour alone), which is the layer this pixel
-// belongs to.
+// belongs to. So do pixels leaving the picture (theirs was never checked), from solidly
+// checked ones, the nearer the better, and preferably with motion that does carry them out.
 [numthreads(8, 8, 1)]
 void flow_fill(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= (uint2)sz.xy)) return;
     int2 x = int2(id.xy);
     float2 v = FlowIn.Load(int3(x, 0));
     int2 m = sz.xy - 1;
-    if (InfoIn.Load(int3(x, 0)).x > OCCLUDED) {
+    float e = InfoIn.Load(int3(x, 0)).x;
+    if (e > OCCLUDED || e < 0.0) {
         float4 cx = look(x);
         float best = 1e30;
         [loop] for (int d = 0; d < 8; d++) {
             int2 dir = int2(DIRS[d]);
-            [loop] for (int s = 1; s <= 64; s *= 2) {
+            [loop] for (int s = 1; s <= 128; s *= 2) {
                 int2 n = x + dir * s;
                 if (any(n < 0) || any(n > m)) break;
-                if (InfoIn.Load(int3(n, 0)).x <= OCCLUDED) {
+                float en = InfoIn.Load(int3(n, 0)).x;
+                if (en >= 0.0 && en <= OCCLUDED && (e >= 0.0 || solid(n, m))) {
                     float4 dc = abs(look(n) - cx);
-                    float c = dc.r + dc.g + dc.b + 3.0 * dc.a + 0.1 * (float)s;
+                    float c = dc.r + dc.g + dc.b + 3.0 * dc.a + (e < 0.0 ? 0.6 : 0.1) * (float)s;
+                    float2 to = float2(x) + 0.5 + FlowIn.Load(int3(n, 0));
+                    if (e < 0.0 && all(to >= 0.0) && all(to <= float2(sz.xy))) c += STAYS;
                     if (c < best) {
                         best = c;
                         v = FlowIn.Load(int3(n, 0));
@@ -691,10 +844,10 @@ void flow_fill(uint3 id : SV_DispatchThreadID) {
     Out2[x] = v;
 }
 
-// Hidden pixels: the median of the filled motion around them (3x3 samples 3 apart), so a hidden area goes with
+// Hidden and leaving pixels: the median of the filled motion around them (3x3 samples 3 apart), so a hidden area goes with
 // one side as a whole instead of pixel by pixel. Unreliability: around each pixel, how much of
 // the change motion leaves unexplained compared with standing still, and whether the area is
-// mostly hidden (no match at all).
+// mostly hidden (no match at all) or, by the picture's edge, grain.
 [numthreads(8, 8, 1)]
 void flow_final(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= (uint2)sz.xy)) return;
@@ -702,7 +855,7 @@ void flow_final(uint3 id : SV_DispatchThreadID) {
     int2 m = sz.xy - 1;
     float4 info = InfoIn.Load(int3(x, 0));
     float2 v = FlowIn.Load(int3(x, 0));
-    if (info.x > OCCLUDED) {
+    if (info.x > OCCLUDED || info.x < 0.0) {
         float xs[9];
         float ys[9];
         [unroll] for (int k = 0; k < 9; k++) {
@@ -725,11 +878,29 @@ void flow_final(uint3 id : SV_DispatchThreadID) {
     float u = saturate((smc - 0.6 * s0 - UNEXPLAINED) / (0.3 * s0 + 3.0));
     u = max(u, saturate((smc / max(s0, 1e-3) - RATIO_START) / RATIO_RAMP) * saturate((smc - UNEXPLAINED) / 2.0));
     float hidden = 0.0;
+    float leaving = 0.0;
     [loop] for (int k3 = 0; k3 < 49; k3++) {
         int2 n = clamp(x + int2(k3 % 7 - 3, k3 / 7 - 3) * HIDDEN_STEP, int2(0, 0), m);
-        hidden += InfoIn.Load(int3(n, 0)).x > OCCLUDED ? 1.0 : 0.0;
+        float en = InfoIn.Load(int3(n, 0)).x;
+        hidden += en > OCCLUDED ? 1.0 : 0.0;
+        leaving += en < 0.0 ? 1.0 : 0.0;
     }
     u = max(u, saturate((hidden / 49.0 - HIDDEN_START) / HIDDEN_RAMP));
+    float at_edge = saturate(leaving / 49.0 / LEAVING_SHARE);
+    [branch] if (at_edge > 0.0 && u < 1.0) {
+        float unchecked = 0.0;
+        float ragged = 0.0;
+        [loop] for (int k4 = 0; k4 < 49; k4++) {
+            int2 n = clamp(x + int2(k4 % 7 - 3, k4 / 7 - 3) * 2, int2(0, 0), m);
+            float en = InfoIn.Load(int3(n, 0)).x;
+            unchecked += en > OCCLUDED || en < 0.0 ? 1.0 : 0.0;
+            float2 here = FlowIn.Load(int3(n, 0));
+            float2 right = abs(FlowIn.Load(int3(min(n + int2(1, 0), m), 0)) - here);
+            float2 below = abs(FlowIn.Load(int3(min(n + int2(0, 1), m), 0)) - here);
+            ragged += max(right.x + right.y, below.x + below.y) > RAGGED_STEP + RAGGED_REL * length(here) ? 1.0 : 0.0;
+        }
+        u = max(u, saturate((ragged / 49.0 - RAGGED_START) / RAGGED_RAMP) * saturate(unchecked / 49.0 / 0.3) * at_edge);
+    }
     if ((fl.x & F_COUNT) && info.z > CHANGED) {
         uint old;
         bool hidden_here = info.x > OCCLUDED;
@@ -746,6 +917,16 @@ void flow_final(uint3 id : SV_DispatchThreadID) {
 
 #define EMPTY 0xFFFFFFFF
 #define INDEX_BITS 23
+// clean: neighbours this far out (one ring, or two), counted as coming from elsewhere when
+// their source shift differs by over CLEAN_APART, and mixed in from this share of those on.
+#define CLEAN_REACH 6
+#define CLEAN_INNER 4
+#define CLEAN_OUTER 10
+#define CLEAN_APART 4.0
+#define CLEAN_START 0.125
+#define CLEAN_RAMP 0.25
+#define CLEAN_START_HIGH 0.2
+#define CLEAN_RAMP_HIGH 0.3
 
 
 // Push every pixel of A (z = 0) forward by t, or of B (z = 1) back by 1 - t, onto the 2x2
@@ -757,6 +938,8 @@ void project(uint3 id : SV_DispatchThreadID) {
     float t = misc.x;
     float2 size = float2(sz.xy);
     float2 xc = float2(id.xy) + 0.5;
+    // An overlay doesn't move, and mustn't land on what's round it.
+    [branch] if (held_at(int2(id.xy))) return;
     float4 f = id.z == 0 ? FinA.SampleLevel(Lin, xc / size, 0) : FinB.SampleLevel(Lin, xc / size, 0);
     float2 v = f.xy * misc.y;
     float2 yc = xc + (id.z == 0 ? t : 1.0 - t) * v;
@@ -799,10 +982,61 @@ float side(int2 p, bool fromA, out float2 v, out float u) {
     return hits / 9.0;
 }
 
-[numthreads(16, 16, 1)]
-void compose(uint3 id : SV_DispatchThreadID) {
-    if (any(id.xy >= (uint2)sz.xy)) return;
-    int2 p = int2(id.xy);
+// One side at p without grain. Where the pixels around come from about where p's own does (one
+// thing moving) it's p's own, untouched and sharp. Where enough of them come from elsewhere
+// (nothing matched: every pixel picked something else) it's what they'd each put here,
+// averaged, which can't speckle and, unlike a cross-fade, doesn't show things twice. The fade
+// is averaged too, or it would speckle itself. `rings`: 1 (Balanced) or 2 (High).
+static const int2 AROUND[8] = {
+    int2(-1, -1), int2(0, -1), int2(1, -1), int2(-1, 0),
+    int2(1, 0), int2(-1, 1), int2(0, 1), int2(1, 1),
+};
+
+float3 clean(int2 p, bool fromA, float t, float3 own, inout float u, uint rings) {
+    float2 size = float2(sz.xy);
+    float2 c = float2(p) + 0.5;
+    uint w = (uint)sz.x;
+    uint key0 = fromA ? KeyA.Load(int3(p, 0)) : KeyB.Load(int3(p, 0));
+    uint at0 = key0 & ((1u << INDEX_BITS) - 1);
+    float2 off0 = key0 == EMPTY ? 1e6 : float2(at0 % w, at0 / w) - float2(p);
+    float3 sum = own * 2.0;
+    float usum = u;
+    float seen = 0.0;
+    float apart = 0.0;
+    uint count = 8 * rings;
+    [unroll] for (uint k = 0; k < count; k++) {
+        int reach = rings == 1 ? CLEAN_REACH : (k < 8 ? CLEAN_INNER : CLEAN_OUTER);
+        int2 q = clamp(p + AROUND[k % 8] * reach, int2(0, 0), sz.xy - 1);
+        uint key = fromA ? KeyA.Load(int3(q, 0)) : KeyB.Load(int3(q, 0));
+        float3 there = own;
+        [branch] if (key != EMPTY) {
+            seen += 1.0;
+            uint at = key & ((1u << INDEX_BITS) - 1);
+            float2 src = float2(at % w, at / w);
+            float2 diff = abs(src - float2(q) - off0);
+            [branch] if (diff.x + diff.y > CLEAN_APART) {
+                apart += 1.0;
+                float2 xc = (src + 0.5) / size;
+                float4 f = fromA ? FinA.SampleLevel(Lin, xc, 0) : FinB.SampleLevel(Lin, xc, 0);
+                float2 land = (c - (fromA ? t : 1.0 - t) * f.xy * misc.y) / size;
+                there = fromA ? FA.SampleLevel(Lin, land, 0).rgb : FB.SampleLevel(Lin, land, 0).rgb;
+                usum += f.w;
+            } else {
+                usum += u;
+            }
+        }
+        sum += there;
+    }
+    u = usum / (1.0 + seen);
+    [branch] if (apart == 0.0) return own;
+    float start = rings == 1 ? CLEAN_START : CLEAN_START_HIGH;
+    float ramp = rings == 1 ? CLEAN_RAMP : CLEAN_RAMP_HIGH;
+    float amount = saturate((apart / max(seen, 1.0) - start) / ramp);
+    return lerp(own, sum / (float)(count + 2), amount);
+}
+
+// The made frame at p. `rings`: how far `clean` looks (0 at Light: not at all).
+void compose_at(int2 p, uint rings) {
     // A cut: nothing to follow, so hold A as the source itself does until B is due (the cut then
     // lands on time, in step with the sound).
     uint cost = CountsIn.Load(int3(2, 0, 0));
@@ -822,6 +1056,13 @@ void compose(uint3 id : SV_DispatchThreadID) {
     uint inverted = CountsIn.Load(int3(8, 0, 0));
     uint strong = CountsIn.Load(int3(9, 0, 0));
     float plane = (float)sz.x * (float)sz.y / (misc.y * misc.y);
+    if (changed > 0) {
+        float of = 1.0 / (float)changed;
+        float small_one = saturate((SMALL - (float)changed / plane) / SMALL_RAMP);
+        small_one *= saturate(((float)CountsIn.Load(int3(9, 0, 0)) * of - SMALL_HARD) / LOST_RAMP);
+        small_one *= saturate(((float)CountsIn.Load(int3(6, 0, 0)) * of - SMALL_HIDDEN) / LOST_RAMP);
+        ui = max(ui, small_one * saturate(((float)lost * of - SMALL_LOST) / LOST_RAMP));
+    }
     if ((float)inverted >= INV_BLOCKS * min(1.0, plane / INV_PLANE) && 64.0 * (float)inverted >= INV_SHARE * (float)strong) {
         if ((float)changed < INV_STILL * plane) {
             OutInterp[p] = FB.Load(int3(p, 0));
@@ -830,6 +1071,10 @@ void compose(uint3 id : SV_DispatchThreadID) {
         ui = 1.0;
     }
     if (ui >= 1.0) {
+        OutInterp[p] = float4(lerp(FA.Load(int3(p, 0)).rgb, FB.Load(int3(p, 0)).rgb, t), 1.0);
+        return;
+    }
+    [branch] if (held_at(p)) {
         OutInterp[p] = float4(lerp(FA.Load(int3(p, 0)).rgb, FB.Load(int3(p, 0)).rgb, t), 1.0);
         return;
     }
@@ -850,6 +1095,10 @@ void compose(uint3 id : SV_DispatchThreadID) {
     }
     float3 a = FA.SampleLevel(Lin, (c - t * va) / size, 0).rgb;
     float3 b = FB.SampleLevel(Lin, (c + (1.0 - t) * vb) / size, 0).rgb;
+    [branch] if (rings > 0) {
+        [branch] if (wa > 0.0) a = clean(p, true, t, a, ua, rings);
+        [branch] if (wb > 0.0) b = clean(p, false, t, b, ub, rings);
+    }
     float3 moved = (wa * a + wb * b) / (wa + wb);
     float u = (wa * ua + wb * ub) / (wa + wb);
     // Static things over moving scenery (HUD, subtitles, see-through panels) can pick up the
@@ -882,6 +1131,24 @@ void compose(uint3 id : SV_DispatchThreadID) {
     u = max(u, max(keep, ui));
     float3 still = lerp(FA.Load(int3(p, 0)).rgb, FB.Load(int3(p, 0)).rgb, t);
     OutInterp[p] = float4(lerp(moved, still, u), 1.0);
+}
+
+[numthreads(16, 16, 1)]
+void compose(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= (uint2)sz.xy)) return;
+    compose_at(int2(id.xy), 0);
+}
+
+[numthreads(16, 16, 1)]
+void compose_balanced(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= (uint2)sz.xy)) return;
+    compose_at(int2(id.xy), 1);
+}
+
+[numthreads(16, 16, 1)]
+void compose_high(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= (uint2)sz.xy)) return;
+    compose_at(int2(id.xy), 2);
 }
 
 // ---------------------------------------------------------------------------------------------

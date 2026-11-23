@@ -13,6 +13,7 @@ mod no_signal;
 mod nvof;
 mod overlay;
 mod present;
+mod quality;
 mod settings;
 mod spring;
 mod telemetry;

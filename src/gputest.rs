@@ -263,7 +263,7 @@ pub fn interp_test(src: &Path, out_dir: &Path, other: Option<&Path>) -> Result<(
     f.upload(&gpu, &bb)?;
     f.decode(&gpu, 1, &RGB, true);
     f.estimate(&gpu, 0, 1);
-    f.interpolate(&gpu, 0, 1, 0.5, 0);
+    f.interpolate(&gpu, 0, 1, 0.5, 0, crate::quality::forced().unwrap_or_default());
     let out = rgb_of(&gpu.read(&f.outs[0], 4)?);
     let [_, _, cost, detail, ..] = f.counts(&gpu)?;
 
@@ -284,7 +284,7 @@ pub fn interp_test(src: &Path, out_dir: &Path, other: Option<&Path>) -> Result<(
     let estimate_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
     let t = Instant::now();
     for _ in 0..iters {
-        f.interpolate(&gpu, 0, 1, 0.5, 0);
+        f.interpolate(&gpu, 0, 1, 0.5, 0, crate::quality::forced().unwrap_or_default());
     }
     gpu.wait_idle()?;
     let interp_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
@@ -300,7 +300,7 @@ pub fn interp_test(src: &Path, out_dir: &Path, other: Option<&Path>) -> Result<(
     gpu.profile_begin()?;
     for _ in 0..10 {
         f.estimate(&gpu, 0, 1);
-        f.interpolate(&gpu, 0, 1, 0.5, 0);
+        f.interpolate(&gpu, 0, 1, 0.5, 0, crate::quality::forced().unwrap_or_default());
     }
     let passes = gpu.profile_end()?;
     let total: f64 = passes.iter().map(|p| p.1).sum::<f64>() / 10.0;
@@ -512,12 +512,12 @@ pub fn eval(clip: &Path, out_dir: &Path, skip: usize, keep: &[usize]) -> Result<
         est_ms += t.elapsed().as_secs_f64() * 1000.0;
         let t = Instant::now();
         for j in 1..skip {
-            f.interpolate(&gpu, sa, sb, j as f32 / skip as f32, j - 1);
+            f.interpolate(&gpu, sa, sb, j as f32 / skip as f32, j - 1, crate::quality::forced().unwrap_or_default());
         }
         gpu.wait_idle()?;
         gen_ms += t.elapsed().as_secs_f64() * 1000.0 / (skip - 1) as f64;
         let (a, b) = (read(&f, sa)?, read(&f, sb)?);
-        let [_, _, cost, detail, changed, lost, hidden, unexplained, inverted, strong] = f.counts(&gpu)?;
+        let [_, _, cost, detail, changed, lost, hidden, unexplained, inverted, strong, _] = f.counts(&gpu)?;
         let ch = changed.max(1) as f64;
         let mut line = format!(
             "pair {pair:2} ({ia}->{ib}) cost/detail {:.2} lost/changed {:.2} hidden {:.2} unexplained {:.2} inverted {inverted}/{strong} ({changed}):",
@@ -741,6 +741,11 @@ mod menu_tests {
     /// The frame generated halfway from `a` to `b`, and how far it is from `want` in levels (the
     /// worst 16x16 block).
     fn halfway(gpu: &Gpu, a: &[u8], b: &[u8], want: &[u8]) -> Result<f64> {
+        Ok(worst_block(&made(gpu, a, b, crate::quality::forced().unwrap_or_default())?, want, 0))
+    }
+
+    /// The luma-like green of the frame made halfway from `a` to `b` at `level`.
+    fn made(gpu: &Gpu, a: &[u8], b: &[u8], level: crate::quality::Quality) -> Result<Vec<f64>> {
         let mut f = Frames::new(gpu, W as u32, H as u32, Layout::Nv12)?;
         let dec = Decoding {
             layout: Layout::Nv12,
@@ -755,22 +760,233 @@ mod menu_tests {
             f.decode(gpu, slot, &dec, true);
         }
         f.estimate(gpu, 0, 1);
-        f.interpolate(gpu, 0, 1, 0.5, 0);
+        f.interpolate(gpu, 0, 1, 0.5, 0, level);
         gpu.wait_idle()?;
-        let out = rgb_of(&gpu.read(&f.outs[0], 4)?);
+        Ok(rgb_of(&gpu.read(&f.outs[0], 4)?).iter().map(|p| p[1] as f64).collect())
+    }
+
+    /// How far the worst 16x16 block is from `want` in levels, `margin` in from top and bottom.
+    fn worst_block(out: &[f64], want: &[u8], margin: usize) -> f64 {
         let mut worst = 0.0f64;
-        for by in 0..H / 16 {
+        for by in margin / 16..(H - margin) / 16 {
             for bx in 0..W / 16 {
                 let mut sum = 0.0;
                 for y in by * 16..by * 16 + 16 {
                     for x in bx * 16..bx * 16 + 16 {
-                        sum += (out[y * W + x][1] as f64 - want[y * W + x] as f64).abs();
+                        sum += (out[y * W + x] - want[y * W + x] as f64).abs();
                     }
                 }
                 worst = worst.max(sum / 256.0);
             }
         }
-        Ok(worst)
+        worst
+    }
+
+    /// The outer 64 pixels left and right, away from the corners: how far off they are on
+    /// average, and how many of their 16x16 blocks are over 14 levels off.
+    fn sides(out: &[f64], want: &[u8]) -> (f64, usize) {
+        let (mut total, mut bad, mut n) = (0.0, 0, 0);
+        for by in 2..H / 16 - 2 {
+            for bx in (0..4).chain(W / 16 - 4..W / 16) {
+                let mut sum = 0.0;
+                for y in by * 16..by * 16 + 16 {
+                    for x in bx * 16..bx * 16 + 16 {
+                        sum += (out[y * W + x] - want[y * W + x] as f64).abs();
+                    }
+                }
+                total += sum / 256.0;
+                bad += (sum / 256.0 > 14.0) as usize;
+                n += 1;
+            }
+        }
+        (total / n as f64, bad)
+    }
+
+    /// A smooth random texture of 24-pixel cells, `right` pixels along.
+    fn scene(right: usize) -> Vec<u8> {
+        pan(right, 0)
+    }
+
+    /// The same, `down` pixels down as well.
+    fn pan(right: usize, down: usize) -> Vec<u8> {
+        let at = |x: usize, y: usize| {
+            let h = ((x as u64) << 32 | y as u64).wrapping_add(7).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            ((h ^ (h >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9) >> 56) as f64
+        };
+        let mut f = vec![128u8; W * H * 3 / 2];
+        for y in 0..H {
+            for x in 0..W {
+                let (u, v) = (x + right, y + down);
+                let (cx, cy, fx, fy) = (u / 24, v / 24, (u % 24) as f64 / 24.0, (v % 24) as f64 / 24.0);
+                let top = at(cx, cy) * (1.0 - fx) + at(cx + 1, cy) * fx;
+                let below = at(cx, cy + 1) * (1.0 - fx) + at(cx + 1, cy + 1) * fx;
+                f[y * W + x] = (30.0 + 0.75 * (top * (1.0 - fy) + below * fy)) as u8;
+            }
+        }
+        f
+    }
+
+    /// `pictures` one after another, as in play: the Frames after the last pair, with the
+    /// frame halfway through it made.
+    fn played(gpu: &Gpu, pictures: &[Vec<u8>], level: crate::quality::Quality) -> Result<Frames> {
+        let mut f = Frames::new(gpu, W as u32, H as u32, Layout::Nv12)?;
+        let dec = Decoding {
+            layout: Layout::Nv12,
+            hdr: false,
+            matrix: Matrix::Bt709,
+            gamut_2020: false,
+            full_range: true,
+            white_nits: 370.0,
+        };
+        f.forget_motion();
+        for (i, data) in pictures.iter().enumerate() {
+            f.upload(gpu, data)?;
+            f.decode(gpu, i % 2, &dec, true);
+            if i > 0 {
+                f.estimate(gpu, (i + 1) % 2, i % 2);
+            }
+        }
+        let last = pictures.len() - 1;
+        f.interpolate(gpu, (last + 1) % 2, last % 2, 0.5, 0, level);
+        gpu.wait_idle()?;
+        Ok(f)
+    }
+
+    #[test]
+    fn an_overlay_stays_whole_while_the_camera_pans_under_it() {
+        let Ok(gpu) = Gpu::new() else { return };
+        // Three plain bars with a thin outline, as a game draws health and stamina.
+        let bars = [(64..256usize, 27..42usize, 190u8), (64..266, 57..72, 175), (64..224, 87..102, 150)];
+        let picture = |k: usize| {
+            let mut f = pan(48 * k, 32 * (7 - k));
+            for (xs, ys, fill) in &bars {
+                for y in ys.clone() {
+                    for x in xs.clone() {
+                        let rim = x < xs.start + 2 || x >= xs.end - 2 || y < ys.start + 2 || y >= ys.end - 2;
+                        f[y * W + x] = if rim { 20 } else { *fill };
+                    }
+                }
+            }
+            f
+        };
+        let pictures: Vec<Vec<u8>> = (0..7).map(picture).collect();
+        for level in crate::quality::Quality::ALL {
+            let f = played(&gpu, &pictures, level).unwrap();
+            let out = rgb_of(&gpu.read(&f.outs[0], 4).unwrap());
+            let (mut off, mut n) = (0usize, 0usize);
+            for (xs, ys, _) in &bars {
+                for y in ys.clone() {
+                    for x in xs.clone() {
+                        off += ((out[y * W + x][1] as f64 - pictures[6][y * W + x] as f64).abs() > 20.0) as usize;
+                        n += 1;
+                    }
+                }
+            }
+            assert!(off * 100 <= n, "{level:?}: the overlay tore, {off} of its {n} pixels");
+        }
+    }
+
+    #[test]
+    fn railings_lining_up_once_are_no_overlay() {
+        let Ok(gpu) = Gpu::new() else { return };
+        // Posts every 40 pixels sliding by unevenly, the last time by exactly their spacing.
+        let picture = |at: usize| {
+            let mut f = vec![128u8; W * H * 3 / 2];
+            for y in 0..H {
+                for x in 0..W {
+                    f[y * W + x] = if (x + at) % 40 < 8 { 40 } else { 210 };
+                }
+            }
+            f
+        };
+        let pictures: Vec<Vec<u8>> = [0, 23, 52, 69, 100, 140].map(picture).into();
+        let f = played(&gpu, &pictures, crate::quality::Quality::High).unwrap();
+        let held = f.held_count(&gpu).unwrap();
+        assert_eq!(held, 0, "railings were taken for an overlay");
+    }
+
+    #[test]
+    fn nothing_is_held_while_the_camera_stands_still() {
+        let Ok(gpu) = Gpu::new() else { return };
+        // A big thing crosses a still, hard-edged background: that all stayed, but it isn't an
+        // overlay, and what crosses it mustn't be rubbed out.
+        let picture = |k: usize| {
+            let (mut f, tex) = (menu(0, 0), scene(0));
+            for y in 0..H {
+                for x in 700 + 80 * k..1300 + 80 * k {
+                    f[y * W + x] = tex[y * W + x - 80 * k];
+                }
+            }
+            f
+        };
+        let pictures: Vec<Vec<u8>> = (0..7).map(picture).collect();
+        let f = played(&gpu, &pictures, crate::quality::Quality::High).unwrap();
+        let moving = f.counts(&gpu).unwrap()[10] as usize;
+        assert!(f.held_count(&gpu).unwrap() > 0, "the test needs edges that stayed");
+        // Level 0 is half size here; HELD_MOVING is 0.6 of it.
+        assert!(5 * moving < 3 * (W * H / 4), "a still camera counts as moving: {moving} pixels");
+    }
+
+    #[test]
+    fn what_leaves_the_picture_moves_with_the_rest() {
+        let Ok(gpu) = Gpu::new() else { return };
+        // A pan, both ways: a band at each side is in one picture only.
+        for (a, b) in [(0, 96), (96, 0)] {
+            for level in crate::quality::Quality::ALL {
+                let out = made(&gpu, &scene(a), &scene(b), level).unwrap();
+                let (off, bad) = sides(&out, &scene(48));
+                // (0.2.5: some 10 levels and over a quarter of them. One lucky false match is allowed.)
+                assert!(off < 1.5 && bad <= 5, "{level:?}: a pan from {a} to {b}: edges {off:.2} levels off, {bad} blocks broken");
+            }
+        }
+    }
+
+    #[test]
+    fn a_value_changing_its_text_does_not_tear_and_small_motion_still_moves() {
+        let Ok(gpu) = Gpu::new() else { return };
+        // One row's text changes where it is.
+        let write = |row: usize| {
+            let mut f = menu(0, 0);
+            for y in 680..720 {
+                for x in 900..1140 {
+                    f[y * W + x] = if ink(x, y, 900, 680, row) { 220 } else { 38 };
+                }
+            }
+            f
+        };
+        let (a, b) = (write(7), write(11));
+        let fade: Vec<u8> = a.iter().zip(&b).map(|(&p, &q)| (p as u16 + q as u16).div_ceil(2) as u8).collect();
+        for level in crate::quality::Quality::ALL {
+            let out = made(&gpu, &a, &b, level).unwrap();
+            let off = [&a, &b, &fade].map(|w| worst_block(&out, w, 0)).into_iter().fold(f64::MAX, f64::min);
+            assert!(off < 10.0, "{level:?}: the text tore, {off:.1} levels off");
+        }
+        // A little soft thing moving in a still picture, uncovering some (someone talking):
+        // that's motion, however little of the picture it is.
+        let thing = |dx: usize| {
+            let (mut f, tex, ground) = (vec![128u8; W * H * 3 / 2], scene(0), scene(700));
+            for y in 0..H {
+                for x in 0..W {
+                    let inside = (800 + dx..900 + dx).contains(&x) && (400..480).contains(&y);
+                    f[y * W + x] = if inside { 54 + tex[y * W + x - dx] / 7 } else { 50 + ground[y * W + x] / 12 };
+                }
+            }
+            f
+        };
+        let (a, b, want) = (thing(0), thing(56), thing(28));
+        let fade: Vec<u8> = a.iter().zip(&b).map(|(&p, &q)| (p as u16 + q as u16).div_ceil(2) as u8).collect();
+        let out = made(&gpu, &a, &b, crate::quality::Quality::High).unwrap();
+        // The middle of the thing, away from its border.
+        let off = |w: &[u8]| {
+            let mut sum = 0.0;
+            for y in 412..468 {
+                for x in 862..894 {
+                    sum += (out[y * W + x] - w[y * W + x] as f64).abs();
+                }
+            }
+            sum / (56.0 * 32.0)
+        };
+        assert!(off(&want) < off(&fade), "small motion cross-fades: {:.1} from moved, {:.1} from faded", off(&want), off(&fade));
     }
 
     #[test]

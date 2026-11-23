@@ -28,7 +28,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
-use crate::gpu::{Decoding, Frames, Gpu, Swap};
+use crate::gpu::{Decoding, Frames, Gpu, Swap, Timer};
+use crate::quality::{self, Governor, Plan, Quality, Work};
 use crate::telemetry::{self, Ev, FrameKind};
 use crate::upscale::Upscaler;
 use crate::video::VideoShared;
@@ -720,6 +721,11 @@ struct Video<'a> {
     meta: PresentMeta,
     /// How long a pair's GPU work takes (smoothed), and whether it's been measured yet.
     gpu_time: Duration,
+    /// What the GPU says smoothing's work takes, the level that leaves room for, and the levels
+    /// of the pair being made.
+    timer: Timer<Work>,
+    governor: Governor,
+    plan: Plan,
     gpu_measured: bool,
     grid: Grid,
     /// Slots of the pair the motion field is for, while it has frames still to generate.
@@ -775,6 +781,7 @@ fn run(shared: &VideoShared, rx: Receiver<RawFrame>, spare: Spare, wake: &Wake) 
     let upscaler = Upscaler::new(&gpu)
         .inspect_err(|e| crate::log::line(&format!("upscale: no video processor ({e:#}); using Lanczos")))
         .ok();
+    let timer = Timer::new(&gpu);
     let mut v = Video {
         shared,
         hwnd,
@@ -807,6 +814,9 @@ fn run(shared: &VideoShared, rx: Receiver<RawFrame>, spare: Spare, wake: &Wake) 
         meta: PresentMeta::default(),
         gpu_time: GPU_GUESS,
         gpu_measured: false,
+        timer,
+        governor: Governor::new(quality::forced()),
+        plan: Plan { first: Quality::Light, rest: Quality::Light },
         grid: Grid::new(),
         pair: None,
         refresh: None,
@@ -1104,7 +1114,8 @@ impl Video<'_> {
         };
         for e in self.queue.iter_mut().filter(|e| matches!(e.what, Showing::Pending(..))).take(n) {
             if let Showing::Pending(out, t) = e.what {
-                f.interpolate(&self.gpu, a, b, t, out);
+                let level = self.plan.rest;
+                self.timer.time(&self.gpu, Work::Frame(level), || f.interpolate(&self.gpu, a, b, t, out, level));
                 e.what = Showing::Generated(out);
             }
         }
@@ -1118,6 +1129,9 @@ impl Video<'_> {
             for (seq, counts) in f.poll_counts(&self.gpu) {
                 telemetry::emit(Ev::PairCounts { seq, counts });
             }
+        }
+        while let Some((work, took)) = self.timer.poll(&self.gpu) {
+            self.governor.measured(work, took);
         }
         let Some((fence, at, seq)) = &self.pending else {
             return;
@@ -1167,10 +1181,16 @@ impl Video<'_> {
         telemetry::emit(Ev::Capture { seq: info.seq, at: info.at, copy_us: info.copy_us, w: info.w, h: info.h, input });
     }
 
+    /// What to plan with for the GPU work a present waits for: what it takes, less the part
+    /// that's clean edges (see `Governor::slack_used`).
+    fn planned_gpu(&self) -> Duration {
+        self.gpu_time.saturating_sub(self.governor.slack_used())
+    }
+
     /// Whether a present is due before a new picture's GPU work would be done.
     fn would_delay_present(&self) -> bool {
         self.shared.gpu.target.load(Ordering::Relaxed) > 0
-            && self.queue.front().is_some_and(|e| e.at < Instant::now() + self.gpu_time + DEFER_MARGIN)
+            && self.queue.front().is_some_and(|e| e.at < Instant::now() + self.planned_gpu() + DEFER_MARGIN)
     }
 
     /// Test sessions: what this card frame turned out to be.
@@ -1207,6 +1227,7 @@ impl Video<'_> {
                 let fg = if smoothing { "on" } else { "off" };
                 format!("{}x{} {:?}, frame generation {fg}", raw.w, raw.h, raw.decode.layout)
             });
+            self.governor.reset();
             self.queue.clear();
             self.pair = None;
             self.key = None;
@@ -1338,12 +1359,22 @@ impl Video<'_> {
         }
         self.frame_kind(raw.seq, raw.at, FrameKind::Pair, held_n);
         let submitted = Instant::now();
+        let was = self.governor.level();
+        let pair = quality::Pair { frames: steps - 1, span, waited: self.gpu_time.as_secs_f64() };
+        self.plan = self.governor.plan(&pair, submitted);
+        let level = self.governor.level();
+        if level != was {
+            let why = if level > was { "the GPU has room" } else { "the GPU is busy" };
+            crate::log::line(&format!("smoothing: {} quality ({why})", level.name()));
+            telemetry::note("quality", || level.name().into());
+        }
+        self.shared.meter.set_quality(Some(level));
         let f = self.frames.as_mut().expect("made above");
         // Two pairs' worth of generated frames (see `Frames::outs`), made the first time a
         // pair needs this many: 6 at 30 -> 120, 14 at 30 -> 240.
         f.ensure_outs(&self.gpu, 2 * (steps as usize - 1))?;
         let ring = f.outs.len();
-        f.estimate(&self.gpu, a, slot);
+        self.timer.time(&self.gpu, Work::Motion, || f.estimate(&self.gpu, a, slot));
         if telemetry::on() {
             f.request_counts(&self.gpu, raw.seq);
         }
@@ -1356,7 +1387,8 @@ impl Video<'_> {
             let t = j as f32 / steps as f32;
             self.out_meta[out] = (raw.seq, t);
             if j == 1 {
-                f.interpolate(&self.gpu, a, slot, t, out);
+                let level = self.plan.first;
+                self.timer.time(&self.gpu, Work::Frame(level), || f.interpolate(&self.gpu, a, slot, t, out, level));
                 made.push(Showing::Generated(out));
             } else {
                 made.push(Showing::Pending(out, t));
@@ -1374,7 +1406,7 @@ impl Video<'_> {
         // early.
         let now = Instant::now();
         let step = span / steps as f64;
-        let ready = submitted + self.gpu_time;
+        let ready = submitted + self.planned_gpu();
         let (mut first, every) = match timing {
             Some((next, period)) => {
                 let k = (step / period.as_secs_f64()).round().max(1.0) as u32;
@@ -1385,7 +1417,7 @@ impl Video<'_> {
                     at += period;
                 }
                 // Had it not waited behind the last picture's present.
-                let prompt = raw.at + Duration::from_micros(raw.copy_us.into()) + (submitted - taken) + self.gpu_time;
+                let prompt = raw.at + Duration::from_micros(raw.copy_us.into()) + (submitted - taken) + self.planned_gpu();
                 let mut could = at;
                 while could >= prompt + period {
                     could -= period;

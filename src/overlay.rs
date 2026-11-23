@@ -75,6 +75,9 @@ pub fn panel(mode: Overlay, n: &Numbers, graphs: Option<&(Graph, Option<Graph>)>
     if let Some(g) = n.gpu_ms.filter(|_| n.generated > 0.0) {
         timing = timing.child(stat("GPU", format!("{g:.1} ms")));
     }
+    if let Some(q) = n.quality.filter(|_| n.generated > 0.0) {
+        timing = timing.child(stat("quality", q.name().to_string()));
+    }
 
     div()
         .flex()
