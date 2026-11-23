@@ -118,6 +118,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     unsafe {
         let prev: WNDPROC = std::mem::transmute(PREV_PROC.load(Ordering::Relaxed));
         match msg {
+            // A click makes this the active app. Left to Windows, a click on the video (a
+            // caption to Windows, for drag-anywhere; or under the controls' window) answers
+            // "don't activate" and the window is activated later in the press, too late to
+            // count as the user's: active inside Passthru, but the taskbar and the keyboard
+            // stayed with the app before.
+            WM_MOUSEACTIVATE => {
+                if GetForegroundWindow() != hwnd {
+                    let _ = SetForegroundWindow(hwnd);
+                }
+                return LRESULT(MA_ACTIVATE as isize);
+            }
             WM_SIZING => {
                 constrain(hwnd, wparam.0 as u32, &mut *(lparam.0 as *mut RECT));
                 return LRESULT(1);
