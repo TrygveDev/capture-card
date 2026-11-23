@@ -76,10 +76,16 @@ pub fn spawn(shared: Arc<AudioShared>, device: Option<String>) {
         .spawn(move || {
             com_init();
             crate::raise_thread_priority("Pro Audio");
+            // Logged once per new error: a card that's unplugged fails every second.
+            let mut last = String::new();
             loop {
                 if let Err(e) = run_capture(&s, device.as_deref()) {
-                    eprintln!("audio capture: {e:#}");
-                    *s.status.lock().unwrap() = format!("{e:#}");
+                    let e = format!("{e:#}");
+                    if e != last {
+                        crate::log::line(&format!("audio capture: {e}"));
+                        last = e.clone();
+                    }
+                    *s.status.lock().unwrap() = e;
                 }
                 s.rate.store(0, Ordering::Release);
                 std::thread::sleep(Duration::from_secs(1));
@@ -91,9 +97,14 @@ pub fn spawn(shared: Arc<AudioShared>, device: Option<String>) {
         .spawn(move || {
             com_init();
             crate::raise_thread_priority("Pro Audio");
+            let mut last = String::new();
             loop {
                 if let Err(e) = run_render(&shared) {
-                    eprintln!("audio render: {e:#}");
+                    let e = format!("{e:#}");
+                    if e != last {
+                        crate::log::line(&format!("audio render: {e}"));
+                        last = e;
+                    }
                     std::thread::sleep(Duration::from_secs(1));
                 }
             }
@@ -180,6 +191,8 @@ fn find_capture(e: &IMMDeviceEnumerator, wanted: Option<&str>) -> Result<IMMDevi
 
 /// An initialised, event-driven shared-mode stream.
 struct Stream {
+    /// How it was opened (for the log): low-latency, standard, or converted by Windows.
+    how: &'static str,
     client: IAudioClient,
     event: HANDLE,
     rate: u32,
@@ -263,7 +276,7 @@ fn open_stream(device: &IMMDevice, want_rate: Option<u32>) -> Result<Stream> {
                             )
                             .is_ok()
                     {
-                        return finish(client.clone(), event, mix_rate, mix_ch, mix_float, min);
+                        return finish(client.clone(), event, mix_rate, mix_ch, mix_float, min, "low-latency");
                     }
                 }
                 client.Initialize(
@@ -277,7 +290,7 @@ fn open_stream(device: &IMMDevice, want_rate: Option<u32>) -> Result<Stream> {
                 let mut def = 0i64;
                 client.GetDevicePeriod(Some(&mut def), None)?;
                 let period = (def as u64 * mix_rate as u64 / 10_000_000) as u32;
-                return finish(client.clone(), event, mix_rate, mix_ch, mix_float, period);
+                return finish(client.clone(), event, mix_rate, mix_ch, mix_float, period, "standard");
             }
             let rate = want_rate.unwrap_or(48_000);
             let fmt = stereo_float(rate);
@@ -294,7 +307,7 @@ fn open_stream(device: &IMMDevice, want_rate: Option<u32>) -> Result<Stream> {
             let mut def = 0i64;
             client.GetDevicePeriod(Some(&mut def), None)?;
             let period = (def as u64 * rate as u64 / 10_000_000) as u32;
-            finish(client.clone(), event, rate, 2, true, period)
+            finish(client.clone(), event, rate, 2, true, period, "converted")
         })();
         CoTaskMemFree(Some(mix as _));
         if result.is_err() {
@@ -312,11 +325,12 @@ unsafe fn finish(
     float: bool,
 
     period_frames: u32,
+    how: &'static str,
 ) -> Result<Stream> {
     unsafe {
         client.SetEventHandle(event)?;
         let buffer_frames = client.GetBufferSize()?;
-        Ok(Stream { client, event, rate, channels, float, buffer_frames, period_frames })
+        Ok(Stream { how, client, event, rate, channels, float, buffer_frames, period_frames })
     }
 }
 
@@ -347,13 +361,14 @@ fn run_capture(shared: &AudioShared, wanted: Option<&str>) -> Result<()> {
     let name = friendly_name(&device);
     let stream = open_stream(&device, None)?;
     let capture: IAudioCaptureClient = unsafe { stream.client.GetService()? };
-    eprintln!(
-        "audio in: {name}  {} Hz {}ch, period {} frames ({:.2} ms)",
+    crate::log::line(&format!(
+        "audio in: {name}  {} Hz {}ch, {}, period {} frames ({:.2} ms)",
         stream.rate,
         stream.channels,
+        stream.how,
         stream.period_frames,
         stream.period_frames as f64 * 1000.0 / stream.rate as f64
-    );
+    ));
     shared.queue.lock().unwrap().clear();
     shared.packet.store(stream.period_frames as usize, Ordering::Relaxed);
     shared.rate.store(stream.rate, Ordering::Release);
@@ -527,15 +542,16 @@ fn run_render(shared: &AudioShared) -> Result<()> {
         bail!("output opened at {} Hz, wanted {rate}", stream.rate);
     }
     let render: IAudioRenderClient = unsafe { stream.client.GetService()? };
-    eprintln!(
-        "audio out: {}  {} Hz {}ch, period {} frames ({:.2} ms), buffer {} frames",
+    crate::log::line(&format!(
+        "audio out: {}  {} Hz {}ch, {}, period {} frames ({:.2} ms), buffer {} frames",
         friendly_name(&device),
         stream.rate,
         stream.channels,
+        stream.how,
         stream.period_frames,
         stream.period_frames as f64 * 1000.0 / stream.rate as f64,
         stream.buffer_frames
-    );
+    ));
     let ms = |m: usize| rate as usize * m / 1000;
     let period = (stream.period_frames as usize).max(1);
     let guard = ms(1);
